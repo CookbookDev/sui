@@ -3,16 +3,16 @@
 
 use anyhow::Result;
 use std::collections::BTreeMap;
-use std::path::Path;
 use sui_data_ingestion_core::Worker;
 use sui_types::SYSTEM_PACKAGE_ADDRESSES;
 use tokio::sync::Mutex;
 
 use sui_package_resolver::Resolver;
-use sui_rest_api::{CheckpointData, CheckpointTransaction};
+use sui_types::full_checkpoint_content::{CheckpointData, CheckpointTransaction};
 use sui_types::object::Object;
 
 use crate::handlers::{get_move_struct, parse_struct, AnalyticsHandler};
+use crate::AnalyticsMetrics;
 
 use crate::package_store::{LocalDBPackageStore, PackageCache};
 use crate::tables::WrappedObjectEntry;
@@ -20,6 +20,7 @@ use crate::FileType;
 
 pub struct WrappedObjectHandler {
     state: Mutex<State>,
+    metrics: AnalyticsMetrics,
 }
 
 struct State {
@@ -30,7 +31,9 @@ struct State {
 
 #[async_trait::async_trait]
 impl Worker for WrappedObjectHandler {
-    async fn process_checkpoint(&self, checkpoint_data: CheckpointData) -> Result<()> {
+    type Result = ();
+
+    async fn process_checkpoint(&self, checkpoint_data: &CheckpointData) -> Result<()> {
         let CheckpointData {
             checkpoint_summary,
             transactions: checkpoint_transactions,
@@ -45,7 +48,7 @@ impl Worker for WrappedObjectHandler {
                 checkpoint_summary.epoch,
                 checkpoint_summary.sequence_number,
                 checkpoint_summary.timestamp_ms,
-                &checkpoint_transaction,
+                checkpoint_transaction,
                 &mut state,
             )
             .await?;
@@ -79,14 +82,13 @@ impl AnalyticsHandler<WrappedObjectEntry> for WrappedObjectHandler {
 }
 
 impl WrappedObjectHandler {
-    pub fn new(store_path: &Path, rest_uri: &str) -> Self {
-        let package_store = LocalDBPackageStore::new(&store_path.join("wrapped_object"), rest_uri);
+    pub fn new(package_store: LocalDBPackageStore, metrics: AnalyticsMetrics) -> Self {
         let state = Mutex::new(State {
             wrapped_objects: vec![],
             package_store: package_store.clone(),
             resolver: Resolver::new(PackageCache::new(package_store)),
         });
-        WrappedObjectHandler { state }
+        WrappedObjectHandler { state, metrics }
     }
     async fn process_transaction(
         &self,
@@ -115,8 +117,28 @@ impl WrappedObjectHandler {
             .struct_tag()
             .and_then(|tag| object.data.try_as_move().map(|mo| (tag, mo.contents())))
         {
-            let move_struct = get_move_struct(&tag, contents, &state.resolver).await?;
-            Some(move_struct)
+            match get_move_struct(&tag, contents, &state.resolver).await {
+                Ok(move_struct) => Some(move_struct),
+                Err(err)
+                    if err
+                        .downcast_ref::<sui_types::object::bounded_visitor::Error>()
+                        .filter(|e| {
+                            matches!(e, sui_types::object::bounded_visitor::Error::OutOfBudget)
+                        })
+                        .is_some() =>
+                {
+                    self.metrics
+                        .total_too_large_to_deserialize
+                        .with_label_values(&[self.name()])
+                        .inc();
+                    tracing::warn!(
+                        "Skipping struct with type {} because it was too large.",
+                        tag
+                    );
+                    None
+                }
+                Err(err) => return Err(err),
+            }
         } else {
             None
         };

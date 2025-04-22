@@ -262,9 +262,7 @@ impl<T: Deref<Target = BasicBlocks>> CFG for ForwardCFG<T> {
     fn is_back_edge(&self, cur: Label, next: Label) -> bool {
         self.loop_heads
             .get(&next)
-            .map_or(false, |back_edge_predecessors| {
-                back_edge_predecessors.contains(&cur)
-            })
+            .is_some_and(|back_edge_predecessors| back_edge_predecessors.contains(&cur))
     }
 
     fn debug(&self) {
@@ -579,7 +577,7 @@ impl<'forward, Blocks: Deref<Target = BasicBlocks>> ReverseCFG<'forward, Blocks>
     }
 }
 
-impl<'forward, 'blocks> MutReverseCFG<'forward, 'blocks> {
+impl MutReverseCFG<'_, '_> {
     pub fn block_mut(&mut self, label: Label) -> &mut BasicBlock {
         if label == self.terminal {
             &mut self.terminal_block
@@ -595,7 +593,7 @@ impl<'forward, 'blocks> MutReverseCFG<'forward, 'blocks> {
     }
 }
 
-impl<'forward, Blocks: Deref<Target = BasicBlocks>> Drop for ReverseCFG<'forward, Blocks> {
+impl<Blocks: Deref<Target = BasicBlocks>> Drop for ReverseCFG<'_, Blocks> {
     fn drop(&mut self) {
         assert!(self.terminal_block.is_empty());
         let start_predecessors = self.predecessor_map.remove(&self.terminal);
@@ -613,7 +611,7 @@ impl<'forward, Blocks: Deref<Target = BasicBlocks>> Drop for ReverseCFG<'forward
     }
 }
 
-impl<'forward, Blocks: Deref<Target = BasicBlocks>> CFG for ReverseCFG<'forward, Blocks> {
+impl<Blocks: Deref<Target = BasicBlocks>> CFG for ReverseCFG<'_, Blocks> {
     fn successors(&self, label: Label) -> &BTreeSet<Label> {
         self.successor_map.get(&label).unwrap()
     }
@@ -646,9 +644,7 @@ impl<'forward, Blocks: Deref<Target = BasicBlocks>> CFG for ReverseCFG<'forward,
     fn is_back_edge(&self, cur: Label, next: Label) -> bool {
         self.loop_heads
             .get(&next)
-            .map_or(false, |back_edge_predecessors| {
-                back_edge_predecessors.contains(&cur)
-            })
+            .is_some_and(|back_edge_predecessors| back_edge_predecessors.contains(&cur))
     }
 
     fn debug(&self) {
@@ -684,7 +680,7 @@ impl<T: Deref<Target = BasicBlocks>> AstDebug for ForwardCFG<T> {
     }
 }
 
-impl<'a, T: Deref<Target = BasicBlocks>> AstDebug for ReverseCFG<'a, T> {
+impl<T: Deref<Target = BasicBlocks>> AstDebug for ReverseCFG<'_, T> {
     fn ast_debug(&self, w: &mut AstWriter) {
         let ReverseCFG {
             terminal,
@@ -697,7 +693,7 @@ impl<'a, T: Deref<Target = BasicBlocks>> AstDebug for ReverseCFG<'a, T> {
             loop_heads,
         } = self;
         w.writeln("--ReverseBlockCFG--");
-        w.writeln(&format!("terminal: {}", terminal));
+        w.writeln(format!("terminal: {}", terminal));
         ast_debug_cfg(
             w,
             traversal_order[0],
@@ -722,8 +718,8 @@ fn ast_debug_cfg<'a>(
     w.write("successor_map:");
     w.indent(4, |w| {
         for (lbl, nexts) in successor_map {
-            w.write(&format!("{} => [", lbl));
-            w.comma(nexts, |w, next| w.write(&format!("{}", next)));
+            w.write(format!("{} => [", lbl));
+            w.comma(nexts, |w, next| w.write(format!("{}", next)));
             w.writeln("]")
         }
     });
@@ -731,8 +727,8 @@ fn ast_debug_cfg<'a>(
     w.write("predecessor_map:");
     w.indent(4, |w| {
         for (lbl, nexts) in predecessor_map {
-            w.write(&format!("{} <= [", lbl));
-            w.comma(nexts, |w, next| w.write(&format!("{}", next)));
+            w.write(format!("{} <= [", lbl));
+            w.comma(nexts, |w, next| w.write(format!("{}", next)));
             w.writeln("]")
         }
     });
@@ -740,7 +736,7 @@ fn ast_debug_cfg<'a>(
     w.write("traversal:");
     w.indent(4, |w| {
         for (cur, next) in traversal {
-            w.writeln(&format!("{} => {}", cur, next))
+            w.writeln(format!("{} => {}", cur, next))
         }
     });
 
@@ -748,7 +744,7 @@ fn ast_debug_cfg<'a>(
     w.indent(4, |w| {
         for (loop_head, back_edge_predecessors) in loop_heads {
             for pred in back_edge_predecessors {
-                w.writeln(&format!(
+                w.writeln(format!(
                     "loop head: {}. back edge predecessor: {}",
                     loop_head, pred
                 ))
@@ -756,7 +752,7 @@ fn ast_debug_cfg<'a>(
         }
     });
 
-    w.writeln(&format!("start: {}", start));
+    w.writeln(format!("start: {}", start));
     w.writeln("blocks:");
     w.indent(4, |w| blocks.ast_debug(w));
 }

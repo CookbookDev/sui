@@ -6,11 +6,9 @@
 
 use core::panic;
 use fastcrypto::encoding::Base64;
-use jsonrpsee::{
-    core::{client::ClientT, RpcResult},
-    rpc_params,
-};
+use jsonrpsee::{core::client::ClientT, rpc_params};
 use std::fs::File;
+use std::num::NonZeroUsize;
 use std::time::Duration;
 use sui_core::authority_client::make_network_authority_clients_with_network_config;
 use sui_core::authority_client::AuthorityAPI;
@@ -25,7 +23,9 @@ use sui_network::default_mysten_network_config;
 use sui_swarm_config::network_config_builder::ConfigBuilder;
 use sui_test_transaction_builder::batch_make_transfer_transactions;
 use sui_types::{
+    crypto::Ed25519SuiSignature,
     quorum_driver_types::ExecuteTransactionRequestType,
+    signature::GenericSignature,
     traffic_control::{
         FreqThresholdConfig, PolicyConfig, PolicyType, RemoteFirewallConfig, Weight,
     },
@@ -45,6 +45,7 @@ async fn test_validator_traffic_control_noop() -> Result<(), anyhow::Error> {
         ..Default::default()
     };
     let network_config = ConfigBuilder::new_with_temp_dir()
+        .committee_size(NonZeroUsize::new(4).unwrap())
         .with_policy_config(Some(policy_config))
         .build();
     let test_cluster = TestClusterBuilder::new()
@@ -88,6 +89,7 @@ async fn test_validator_traffic_control_ok() -> Result<(), anyhow::Error> {
         ..Default::default()
     };
     let network_config = ConfigBuilder::new_with_temp_dir()
+        .committee_size(NonZeroUsize::new(4).unwrap())
         .with_policy_config(Some(policy_config))
         .build();
     let test_cluster = TestClusterBuilder::new()
@@ -133,6 +135,7 @@ async fn test_validator_traffic_control_dry_run() -> Result<(), anyhow::Error> {
         ..Default::default()
     };
     let network_config = ConfigBuilder::new_with_temp_dir()
+        .committee_size(NonZeroUsize::new(4).unwrap())
         .with_policy_config(Some(policy_config))
         .build();
     let test_cluster = TestClusterBuilder::new()
@@ -195,7 +198,7 @@ async fn test_fullnode_traffic_control_dry_run() -> Result<(), anyhow::Error> {
 
     // it should take no more than 4 requests to be added to the blocklist
     for _ in 0..txn_count {
-        let response: RpcResult<SuiTransactionBlockResponse> = jsonrpc_client
+        let response: Result<SuiTransactionBlockResponse, _> = jsonrpc_client
             .request("sui_getTransactionBlock", rpc_params![*tx_digest])
             .await;
         assert!(
@@ -217,10 +220,11 @@ async fn test_validator_traffic_control_error_blocked() -> Result<(), anyhow::Er
         ..Default::default()
     };
     let network_config = ConfigBuilder::new_with_temp_dir()
+        .committee_size(NonZeroUsize::new(4).unwrap())
         .with_policy_config(Some(policy_config))
         .build();
     let committee = network_config.committee_with_network();
-    let _test_cluster = TestClusterBuilder::new()
+    let test_cluster = TestClusterBuilder::new()
         .set_network_config(network_config)
         .build()
         .await;
@@ -230,12 +234,13 @@ async fn test_validator_traffic_control_error_blocked() -> Result<(), anyhow::Er
     );
     let (_, auth_client) = local_clients.first_key_value().unwrap();
 
-    // transaction signed using user wallet from a different chain/genesis,
-    // therefore we should fail with UserInputError
-    let other_cluster = TestClusterBuilder::new().build().await;
-
-    let mut txns = batch_make_transfer_transactions(&other_cluster.wallet, n as usize).await;
-    let tx = txns.swap_remove(0);
+    let mut txns = batch_make_transfer_transactions(&test_cluster.wallet, n as usize).await;
+    let mut tx = txns.swap_remove(0);
+    let signatures = tx.tx_signatures_mut_for_testing();
+    signatures.pop();
+    signatures.push(GenericSignature::Signature(
+        sui_types::crypto::Signature::Ed25519SuiSignature(Ed25519SuiSignature::default()),
+    ));
 
     // it should take no more than 4 requests to be added to the blocklist
     for _ in 0..n {
@@ -246,7 +251,7 @@ async fn test_validator_traffic_control_error_blocked() -> Result<(), anyhow::Er
             }
         }
     }
-    panic!("Expected spam policy to trigger within {n} requests");
+    panic!("Expected error policy to trigger within {n} requests");
 }
 
 #[tokio::test]
@@ -299,7 +304,7 @@ async fn test_fullnode_traffic_control_spam_blocked() -> Result<(), anyhow::Erro
 
     // it should take no more than 4 requests to be added to the blocklist
     for _ in 0..txn_count {
-        let response: RpcResult<SuiTransactionBlockResponse> = jsonrpc_client
+        let response: Result<SuiTransactionBlockResponse, _> = jsonrpc_client
             .request("sui_getTransactionBlock", rpc_params![*tx_digest])
             .await;
         if let Err(err) = response {
@@ -354,7 +359,7 @@ async fn test_fullnode_traffic_control_error_blocked() -> Result<(), anyhow::Err
             SuiTransactionBlockResponseOptions::new(),
             ExecuteTransactionRequestType::WaitForLocalExecution
         ];
-        let response: RpcResult<SuiTransactionBlockResponse> = jsonrpc_client
+        let response: Result<SuiTransactionBlockResponse, _> = jsonrpc_client
             .request("sui_executeTransactionBlock", params.clone())
             .await;
         if let Err(err) = response {
@@ -396,11 +401,12 @@ async fn test_validator_traffic_control_error_delegated() -> Result<(), anyhow::
         drain_timeout_secs: 10,
     };
     let network_config = ConfigBuilder::new_with_temp_dir()
+        .committee_size(NonZeroUsize::new(4).unwrap())
         .with_policy_config(Some(policy_config))
         .with_firewall_config(Some(firewall_config))
         .build();
     let committee = network_config.committee_with_network();
-    let _test_cluster = TestClusterBuilder::new()
+    let test_cluster = TestClusterBuilder::new()
         .set_network_config(network_config)
         .build()
         .await;
@@ -410,18 +416,19 @@ async fn test_validator_traffic_control_error_delegated() -> Result<(), anyhow::
     );
     let (_, auth_client) = local_clients.first_key_value().unwrap();
 
-    // transaction signed using user wallet from a different chain/genesis,
-    // therefore we should fail with UserInputError
-    let other_cluster = TestClusterBuilder::new().build().await;
-
-    let mut txns = batch_make_transfer_transactions(&other_cluster.wallet, n as usize).await;
-    let tx = txns.swap_remove(0);
+    let mut txns = batch_make_transfer_transactions(&test_cluster.wallet, n as usize).await;
+    let mut tx = txns.swap_remove(0);
+    let signatures = tx.tx_signatures_mut_for_testing();
+    signatures.pop();
+    signatures.push(GenericSignature::Signature(
+        sui_types::crypto::Signature::Ed25519SuiSignature(Ed25519SuiSignature::default()),
+    ));
 
     // start test firewall server
     let mut server = NodeFwTestServer::new();
     server.start(port).await;
     // await for the server to start
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
     // it should take no more than 4 requests to be added to the blocklist
     for _ in 0..n {
@@ -507,7 +514,7 @@ async fn test_fullnode_traffic_control_spam_delegated() -> Result<(), anyhow::Er
     assert!(confirmed_local_execution.unwrap());
 
     for _ in 0..txn_count {
-        let response: RpcResult<SuiTransactionBlockResponse> = jsonrpc_client
+        let response: Result<SuiTransactionBlockResponse, _> = jsonrpc_client
             .request("sui_getTransactionBlock", rpc_params![*tx_digest])
             .await;
         assert!(response.is_ok(), "Expected request to succeed");
@@ -547,7 +554,7 @@ async fn test_traffic_control_dead_mans_switch() -> Result<(), anyhow::Error> {
     // NOTE: we need to hold onto this tc handle to ensure we don't inadvertently close
     // the receive channel (this would cause traffic controller to exit the loop and thus
     // we will never engage the dead mans switch)
-    let _tc = TrafficController::spawn_for_test(policy_config, Some(firewall_config));
+    let _tc = TrafficController::init_for_test(policy_config, Some(firewall_config));
     assert!(
         !drain_path.exists(),
         "Expected drain file to not exist after startup unless previously set",
@@ -704,6 +711,32 @@ async fn test_traffic_sketch_with_sampled_spam() {
     assert!(metrics.num_blocked > (expected_requests / 5) - 1000);
 }
 
+#[sim_test]
+async fn test_traffic_sketch_allowlist_mode() {
+    let policy_config = PolicyConfig {
+        connection_blocklist_ttl_sec: 1,
+        proxy_blocklist_ttl_sec: 1,
+        // first two clients allowlisted, rest blocked
+        allow_list: Some(vec![String::from("127.0.0.0"), String::from("127.0.0.1")]),
+        dry_run: false,
+        ..Default::default()
+    };
+    let metrics = TrafficSim::run(
+        policy_config,
+        4,      // num_clients
+        10_000, // per_client_tps
+        Duration::from_secs(10),
+        true, // report
+    )
+    .await;
+
+    let expected_requests = 10_000 * 10 * 4;
+    // ~half of all requests blocked
+    assert!(metrics.num_blocked >= expected_requests / 2 - 1000);
+    assert!(metrics.num_requests > expected_requests - 1_000);
+    assert!(metrics.num_requests < expected_requests + 200);
+}
+
 async fn assert_traffic_control_ok(mut test_cluster: TestCluster) -> Result<(), anyhow::Error> {
     let context = &mut test_cluster.wallet;
     let jsonrpc_client = &test_cluster.fullnode_handle.rpc_client;
@@ -809,7 +842,7 @@ async fn assert_validator_traffic_control_dry_run(
 
     // it should take no more than 4 requests to be added to the blocklist
     for _ in 0..txn_count {
-        let response: RpcResult<SuiTransactionBlockResponse> = jsonrpc_client
+        let response: Result<SuiTransactionBlockResponse, _> = jsonrpc_client
             .request("sui_getTransactionBlock", rpc_params![*tx_digest])
             .await;
         assert!(

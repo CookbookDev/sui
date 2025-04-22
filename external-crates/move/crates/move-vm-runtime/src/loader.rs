@@ -1339,7 +1339,7 @@ impl Loader {
     // Return an instantiated type given a generic and an instantiation.
     // Stopgap to avoid a recursion that is either taking too long or using too
     // much memory
-    fn subst(&self, ty: &Type, ty_args: &[Type]) -> PartialVMResult<Type> {
+    pub(crate) fn subst(&self, ty: &Type, ty_args: &[Type]) -> PartialVMResult<Type> {
         // Before instantiating the type, count the # of nodes of all type arguments plus
         // existing type instantiation.
         // If that number is larger than MAX_TYPE_INSTANTIATION_NODES, refuse to construct this type.
@@ -1355,6 +1355,14 @@ impl Loader {
             }
         }
         ty.subst(ty_args)
+    }
+
+    pub(crate) fn make_type(
+        &self,
+        module: &CompiledModule,
+        tok: &SignatureToken,
+    ) -> PartialVMResult<Type> {
+        self.module_cache.read().make_type(module, tok)
     }
 
     // Verify the kind (constraints) of an instantiation.
@@ -1386,7 +1394,7 @@ impl Loader {
         self.module_cache.read().function_at(idx)
     }
 
-    fn get_module(
+    pub(crate) fn get_module(
         &self,
         link_context: AccountAddress,
         runtime_id: &ModuleId,
@@ -2195,7 +2203,7 @@ impl Function {
         )
     }
 
-    #[cfg(any(debug_assertions, feature = "debugging"))]
+    #[cfg(any(debug_assertions, feature = "tracing"))]
     pub(crate) fn pretty_short_string(&self) -> String {
         let id = &self.module;
         format!(
@@ -2512,6 +2520,9 @@ impl Loader {
         let type_layout = match ty.datatype_info {
             Datatype::Enum(ref einfo) => {
                 let mut variant_layouts = vec![];
+                if self.vm_config().variant_nodes {
+                    *count += einfo.variants.len() as u64;
+                }
                 for variant in einfo.variants.iter() {
                     let field_tys = variant
                         .fields
@@ -2562,14 +2573,7 @@ impl Loader {
         count: &mut u64,
         depth: u64,
     ) -> PartialVMResult<R::MoveTypeLayout> {
-        if *count
-            > self
-                .vm_config()
-                .max_type_to_layout_nodes
-                .unwrap_or(HISTORICAL_MAX_TYPE_TO_LAYOUT_NODES)
-        {
-            return Err(PartialVMError::new(StatusCode::TOO_MANY_TYPE_NODES));
-        }
+        self.validate_count(count)?;
         if depth > VALUE_DEPTH_MAX {
             return Err(PartialVMError::new(StatusCode::VM_MAX_VALUE_DEPTH_REACHED));
         }
@@ -2602,6 +2606,9 @@ impl Loader {
                 );
             }
         };
+        if self.vm_config().variant_nodes {
+            self.validate_count(count)?;
+        }
         Ok(ty)
     }
 
@@ -2630,6 +2637,9 @@ impl Loader {
         let type_layout = match &ty.datatype_info {
             Datatype::Enum(enum_type) => {
                 let mut variant_layouts = BTreeMap::new();
+                if self.vm_config().variant_nodes {
+                    *count += enum_type.variants.len() as u64;
+                }
                 for variant in enum_type.variants.iter() {
                     if variant.fields.len() != variant.field_names.len() {
                         return Err(
@@ -2686,7 +2696,6 @@ impl Loader {
                 )))
             }
         };
-
         let field_node_count = *count - count_before;
 
         let mut cache = self.type_cache.write();
@@ -2708,19 +2717,12 @@ impl Loader {
         count: &mut u64,
         depth: u64,
     ) -> PartialVMResult<A::MoveTypeLayout> {
-        if *count
-            > self
-                .vm_config()
-                .max_type_to_layout_nodes
-                .unwrap_or(HISTORICAL_MAX_TYPE_TO_LAYOUT_NODES)
-        {
-            return Err(PartialVMError::new(StatusCode::TOO_MANY_TYPE_NODES));
-        }
+        self.validate_count(count)?;
         if depth > VALUE_DEPTH_MAX {
             return Err(PartialVMError::new(StatusCode::VM_MAX_VALUE_DEPTH_REACHED));
         }
         *count += 1;
-        Ok(match ty {
+        let annotated_type_layout = match ty {
             Type::Bool => A::MoveTypeLayout::Bool,
             Type::U8 => A::MoveTypeLayout::U8,
             Type::U16 => A::MoveTypeLayout::U16,
@@ -2747,7 +2749,11 @@ impl Loader {
                         .with_message(format!("no type layout for {:?}", ty)),
                 );
             }
-        })
+        };
+        if self.vm_config().variant_nodes {
+            self.validate_count(count)?;
+        }
+        Ok(annotated_type_layout)
     }
 
     pub(crate) fn type_to_type_tag(&self, ty: &Type) -> PartialVMResult<TypeTag> {
@@ -2769,6 +2775,19 @@ impl Loader {
     ) -> PartialVMResult<A::MoveTypeLayout> {
         let mut count = 0;
         self.type_to_fully_annotated_layout_impl(ty, &mut count, 1)
+    }
+
+    fn validate_count(&self, count: &u64) -> PartialVMResult<()> {
+        if *count
+            > self
+                .vm_config()
+                .max_type_to_layout_nodes
+                .unwrap_or(HISTORICAL_MAX_TYPE_TO_LAYOUT_NODES)
+        {
+            Err(PartialVMError::new(StatusCode::TOO_MANY_TYPE_NODES))
+        } else {
+            Ok(())
+        }
     }
 }
 

@@ -8,14 +8,15 @@ use once_cell::unsync::OnceCell;
 use prometheus::core::{Atomic, AtomicU64};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use sui_core::authority::authority_per_epoch_store::AuthorityPerEpochStore;
 use sui_storage::package_object_cache::PackageObjectCache;
 use sui_types::base_types::{EpochId, ObjectID, ObjectRef, SequenceNumber, VersionNumber};
 use sui_types::error::{SuiError, SuiResult};
 use sui_types::inner_temporary_store::InnerTemporaryStore;
 use sui_types::object::{Object, Owner};
 use sui_types::storage::{
-    get_module_by_id, BackingPackageStore, ChildObjectResolver, GetSharedLocks, ObjectStore,
-    PackageObject, ParentSync,
+    get_module_by_id, BackingPackageStore, ChildObjectResolver, ObjectStore, PackageObject,
+    ParentSync,
 };
 use sui_types::transaction::{InputObjectKind, InputObjects, ObjectReadResult, TransactionKey};
 
@@ -44,30 +45,39 @@ impl InMemoryObjectStore {
     // We will need a trait to unify the these functions. (similarly the one in simulacrum)
     pub(crate) fn read_objects_for_execution(
         &self,
-        shared_locks: &dyn GetSharedLocks,
+        epoch_store: &Arc<AuthorityPerEpochStore>,
         tx_key: &TransactionKey,
         input_object_kinds: &[InputObjectKind],
     ) -> SuiResult<InputObjects> {
-        let shared_locks_cell: OnceCell<HashMap<_, _>> = OnceCell::new();
+        let shared_version_assignments_cell: OnceCell<Option<HashMap<_, _>>> = OnceCell::new();
         let mut input_objects = Vec::new();
         for kind in input_object_kinds {
             let obj: Option<Object> = match kind {
                 InputObjectKind::MovePackage(id) => self.get_package_object(id)?.map(|o| o.into()),
                 InputObjectKind::ImmOrOwnedMoveObject(objref) => {
-                    self.get_object_by_key(&objref.0, objref.1)?
+                    self.get_object_by_key(&objref.0, objref.1)
                 }
 
-                InputObjectKind::SharedMoveObject { id, .. } => {
-                    let shared_locks = shared_locks_cell.get_or_try_init(|| {
-                        Ok::<HashMap<ObjectID, SequenceNumber>, SuiError>(
-                            shared_locks.get_shared_locks(tx_key)?.into_iter().collect(),
-                        )
-                    })?;
-                    let version = shared_locks.get(id).unwrap_or_else(|| {
-                        panic!("Shared object locks should have been set. key: {tx_key:?}, obj id: {id:?}")
+                InputObjectKind::SharedMoveObject {
+                    id,
+                    initial_shared_version,
+                    ..
+                } => {
+                    let shared_version_assignments = shared_version_assignments_cell
+                        .get_or_init(|| {
+                            epoch_store
+                                .get_assigned_shared_object_versions(tx_key)
+                                .map(|l| l.into_iter().collect())
+                        })
+                        .as_ref()
+                        .ok_or_else(|| SuiError::GenericAuthorityError {
+                            error: "Shared object versions should have been assigned.".to_string(),
+                        })?;
+                    let version = shared_version_assignments.get(&(*id, *initial_shared_version)).unwrap_or_else(|| {
+                        panic!("Shared object version should have been assigned. key: {tx_key:?}, obj id: {id:?}")
                     });
 
-                    self.get_object_by_key(id, *version)?
+                    self.get_object_by_key(id, *version)
                 }
             };
 
@@ -94,26 +104,19 @@ impl InMemoryObjectStore {
 }
 
 impl ObjectStore for InMemoryObjectStore {
-    fn get_object(
-        &self,
-        object_id: &ObjectID,
-    ) -> Result<Option<Object>, sui_types::storage::error::Error> {
+    fn get_object(&self, object_id: &ObjectID) -> Option<Object> {
         self.num_object_reads.inc_by(1);
-        Ok(self.objects.read().unwrap().get(object_id).cloned())
+        self.objects.read().unwrap().get(object_id).cloned()
     }
 
-    fn get_object_by_key(
-        &self,
-        object_id: &ObjectID,
-        version: VersionNumber,
-    ) -> Result<Option<Object>, sui_types::storage::error::Error> {
-        Ok(self.get_object(object_id).unwrap().and_then(|o| {
+    fn get_object_by_key(&self, object_id: &ObjectID, version: VersionNumber) -> Option<Object> {
+        self.get_object(object_id).and_then(|o| {
             if o.version() == version {
                 Some(o.clone())
             } else {
                 None
             }
-        }))
+        })
     }
 }
 
@@ -130,7 +133,7 @@ impl ChildObjectResolver for InMemoryObjectStore {
         child: &ObjectID,
         child_version_upper_bound: SequenceNumber,
     ) -> SuiResult<Option<Object>> {
-        Ok(self.get_object(child).unwrap().and_then(|o| {
+        Ok(self.get_object(child).and_then(|o| {
             if o.version() <= child_version_upper_bound
                 && o.owner == Owner::ObjectOwner((*parent).into())
             {
@@ -162,19 +165,7 @@ impl GetModule for InMemoryObjectStore {
 }
 
 impl ParentSync for InMemoryObjectStore {
-    fn get_latest_parent_entry_ref_deprecated(
-        &self,
-        _object_id: ObjectID,
-    ) -> SuiResult<Option<ObjectRef>> {
-        unreachable!()
-    }
-}
-
-impl GetSharedLocks for InMemoryObjectStore {
-    fn get_shared_locks(
-        &self,
-        _key: &TransactionKey,
-    ) -> Result<Vec<(ObjectID, SequenceNumber)>, SuiError> {
+    fn get_latest_parent_entry_ref_deprecated(&self, _object_id: ObjectID) -> Option<ObjectRef> {
         unreachable!()
     }
 }

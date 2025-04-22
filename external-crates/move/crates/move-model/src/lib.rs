@@ -9,7 +9,6 @@ use std::{
     rc::Rc,
 };
 
-use codespan::ByteIndex;
 use codespan_reporting::diagnostic::{Diagnostic, Label, LabelStyle};
 use itertools::Itertools;
 #[allow(unused_imports)]
@@ -23,9 +22,9 @@ use move_binary_format::file_format::{
 use move_compiler::{
     self,
     compiled_unit::{self, AnnotatedCompiledUnit},
-    diagnostics::{Diagnostics, WarningFilters},
-    expansion::ast::{self as E, ModuleIdent, ModuleIdent_, TargetKind},
-    parser::ast as P,
+    diagnostics::{warning_filters::WarningFiltersBuilder, Diagnostics},
+    expansion::ast::{self as E, ModuleIdent, ModuleIdent_},
+    parser::ast::{self as P, TargetKind},
     shared::{parse_named_address, unique_map::UniqueMap, NumericalAddress, PackagePaths},
     typing::ast as T,
     Compiler, Flags, PASS_COMPILATION, PASS_EXPANSION, PASS_PARSER, PASS_TYPING,
@@ -62,7 +61,7 @@ pub fn run_model_builder<
 >(
     move_sources: Vec<PackagePaths<Paths, NamedAddress>>,
     deps: Vec<PackagePaths<Paths, NamedAddress>>,
-    warning_filter: Option<WarningFilters>,
+    warning_filter: Option<WarningFiltersBuilder>,
 ) -> anyhow::Result<GlobalEnv> {
     run_model_builder_with_options(
         move_sources,
@@ -82,7 +81,7 @@ pub fn run_model_builder_with_options<
     move_sources: Vec<PackagePaths<Paths, NamedAddress>>,
     deps: Vec<PackagePaths<Paths, NamedAddress>>,
     options: ModelBuilderOptions,
-    warning_filter: Option<WarningFilters>,
+    warning_filter: Option<WarningFiltersBuilder>,
 ) -> anyhow::Result<GlobalEnv> {
     run_model_builder_with_options_and_compilation_flags(
         move_sources,
@@ -103,7 +102,7 @@ pub fn run_model_builder_with_options_and_compilation_flags<
     deps: Vec<PackagePaths<Paths, NamedAddress>>,
     options: ModelBuilderOptions,
     flags: Flags,
-    warning_filter: Option<WarningFilters>,
+    warning_filter: Option<WarningFiltersBuilder>,
 ) -> anyhow::Result<GlobalEnv> {
     let mut env = GlobalEnv::new();
     env.set_extension(options);
@@ -114,7 +113,7 @@ pub fn run_model_builder_with_options_and_compilation_flags<
             .set_flags(flags)
             .set_warning_filter(warning_filter)
             .run::<PASS_PARSER>()?;
-    let (comment_map, compiler) = match comments_and_compiler_res {
+    let compiler = match comments_and_compiler_res {
         Err((_pass, diags)) => {
             // Add source files so that the env knows how to translate locations of parse errors
             let empty_alias = Rc::new(BTreeMap::new());
@@ -173,18 +172,6 @@ pub fn run_model_builder_with_options_and_compilation_flags<
         }
     }
 
-    // Add any documentation comments found by the Move compiler to the env.
-    for (fhash, documentation) in comment_map {
-        let file_id = env.get_file_id(fhash).expect("file name defined");
-        env.add_documentation(
-            file_id,
-            documentation
-                .into_iter()
-                .map(|(idx, s)| (ByteIndex(idx), s))
-                .collect(),
-        )
-    }
-
     // Step 2: run the compiler up to expansion
     let parsed_prog = {
         let P::Program {
@@ -228,7 +215,10 @@ pub fn run_model_builder_with_options_and_compilation_flags<
 
     // Step 3: selective compilation.
     let expansion_ast = {
-        let E::Program { modules } = expansion_ast;
+        let E::Program {
+            warning_filters_table,
+            modules,
+        } = expansion_ast;
         let modules = modules.filter_map(|mident, mut mdef| {
             visited_modules.contains(&mident.value).then(|| {
                 mdef.target_kind = TargetKind::Source {
@@ -237,10 +227,17 @@ pub fn run_model_builder_with_options_and_compilation_flags<
                 mdef
             })
         });
-        E::Program { modules }
+        E::Program {
+            warning_filters_table,
+            modules,
+        }
     };
     let typing_ast = {
-        let T::Program { info, modules } = typing_ast;
+        let T::Program {
+            info,
+            warning_filters_table,
+            modules,
+        } = typing_ast;
         let modules = modules.filter_map(|mident, mut mdef| {
             visited_modules.contains(&mident.value).then(|| {
                 mdef.target_kind = TargetKind::Source {
@@ -249,7 +246,11 @@ pub fn run_model_builder_with_options_and_compilation_flags<
                 mdef
             })
         });
-        T::Program { info, modules }
+        T::Program {
+            info,
+            warning_filters_table,
+            modules,
+        }
     };
 
     // Run the compiler fully to the compiled units

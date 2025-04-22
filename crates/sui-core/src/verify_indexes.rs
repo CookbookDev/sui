@@ -4,9 +4,8 @@
 use std::sync::Weak;
 use std::{collections::BTreeMap, sync::Arc};
 
+use crate::jsonrpc_index::{CoinIndexKey2, CoinInfo, IndexStore};
 use anyhow::{anyhow, bail, Result};
-use sui_storage::indexes::CoinIndexKey;
-use sui_storage::{indexes::CoinInfo, IndexStore};
 use sui_types::{base_types::ObjectInfo, object::Owner};
 use tracing::info;
 use typed_store::traits::Map;
@@ -41,7 +40,7 @@ pub fn verify_indexes(store: &dyn AccumulatorStore, indexes: Arc<IndexStore>) ->
         if let Some(type_tag) = object.coin_type_maybe() {
             let info =
                 CoinInfo::from_object(&object).expect("already checked that this is a coin type");
-            let key = (owner, type_tag.to_string(), object.id());
+            let key = CoinIndexKey2::new(owner, type_tag.to_string(), info.balance, object.id());
 
             coin_index.insert(key, info);
         }
@@ -50,7 +49,8 @@ pub fn verify_indexes(store: &dyn AccumulatorStore, indexes: Arc<IndexStore>) ->
     tracing::info!("Live objects set is prepared, about to verify indexes");
 
     // Verify Owner Index
-    for (key, info) in indexes.tables().owner_index().unbounded_iter() {
+    for item in indexes.tables().owner_index().safe_iter() {
+        let (key, info) = item?;
         let calculated_info = owner_index.remove(&key).ok_or_else(|| {
             anyhow!(
                 "owner_index: found extra, unexpected entry {:?}",
@@ -69,7 +69,8 @@ pub fn verify_indexes(store: &dyn AccumulatorStore, indexes: Arc<IndexStore>) ->
     tracing::info!("Owner index is good");
 
     // Verify Coin Index
-    for (key, info) in indexes.tables().coin_index().unbounded_iter() {
+    for item in indexes.tables().coin_index().safe_iter() {
+        let (key, info) = item?;
         let calculated_info = coin_index.remove(&key).ok_or_else(|| {
             anyhow!(
                 "coin_index: found extra, unexpected entry {:?}",
@@ -94,16 +95,17 @@ pub fn verify_indexes(store: &dyn AccumulatorStore, indexes: Arc<IndexStore>) ->
 
 // temporary code to repair the coin index. This should be removed in the next release
 pub async fn fix_indexes(authority_state: Weak<AuthorityState>) -> Result<()> {
-    let is_violation = |coin_index_key: &CoinIndexKey,
-                        state: &Arc<AuthorityState>|
-     -> anyhow::Result<bool> {
-        if let Some(object) = state.get_object_store().get_object(&coin_index_key.2)? {
-            if matches!(object.owner, Owner::AddressOwner(real_owner_id) | Owner::ObjectOwner(real_owner_id) if coin_index_key.0 == real_owner_id)
+    let is_violation = |coin_index_key: &CoinIndexKey2, state: &Arc<AuthorityState>| -> bool {
+        if let Some(object) = state
+            .get_object_store()
+            .get_object(&coin_index_key.object_id)
+        {
+            if matches!(object.owner, Owner::AddressOwner(real_owner_id) | Owner::ObjectOwner(real_owner_id) if coin_index_key.owner == real_owner_id)
             {
-                return Ok(false);
+                return false;
             }
         }
-        Ok(true)
+        true
     };
 
     tracing::info!("Starting fixing coin index");
@@ -113,8 +115,9 @@ pub async fn fix_indexes(authority_state: Weak<AuthorityState>) -> Result<()> {
         if let Some(authority) = authority_state_clone.upgrade() {
             let mut batch = vec![];
             if let Some(indexes) = &authority.indexes {
-                for (coin_index_key, _) in indexes.tables().coin_index().unbounded_iter() {
-                    if is_violation(&coin_index_key, &authority)? {
+                for entry in indexes.tables().coin_index().safe_iter() {
+                    let (coin_index_key, _) = entry?;
+                    if is_violation(&coin_index_key, &authority) {
                         batch.push(coin_index_key);
                     }
                 }
@@ -131,11 +134,10 @@ pub async fn fix_indexes(authority_state: Weak<AuthorityState>) -> Result<()> {
                 let _locks = indexes
                     .caches
                     .locks
-                    .acquire_locks(chunk.iter().map(|key| key.0))
-                    .await;
+                    .acquire_locks(chunk.iter().map(|key| key.owner));
                 let mut batch = vec![];
                 for key in chunk {
-                    if is_violation(key, &authority)? {
+                    if is_violation(key, &authority) {
                         batch.push(key);
                     }
                 }

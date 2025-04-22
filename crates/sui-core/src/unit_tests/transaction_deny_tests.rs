@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::authority::authority_test_utils::{
+use crate::authority::auth_unit_test_utils::{
     publish_package_on_single_authority, upgrade_package_on_single_authority,
 };
 use crate::authority::test_authority_builder::TestAuthorityBuilder;
@@ -289,7 +289,7 @@ async fn test_package_denied() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     // Publish 3 packages, where b depends on c, and a depends on b.
     // Also upgrade c to c', and upgrade b to b' (which will start using c' instead of c as dependency).
-    let (package_c, cap_c) = publish_package_on_single_authority(
+    let (tx_c, (package_c, cap_c)) = publish_package_on_single_authority(
         &path.join("src/unit_tests/data/package_deny/c"),
         accounts[0].0,
         &accounts[0].1,
@@ -300,7 +300,7 @@ async fn test_package_denied() {
     )
     .await
     .unwrap();
-    let (package_b, cap_b) = publish_package_on_single_authority(
+    let (tx_b, (package_b, cap_b)) = publish_package_on_single_authority(
         &path.join("src/unit_tests/data/package_deny/b"),
         accounts[0].0,
         &accounts[0].1,
@@ -311,7 +311,7 @@ async fn test_package_denied() {
     )
     .await
     .unwrap();
-    let (package_a, cap_a) = publish_package_on_single_authority(
+    let (tx_a, (package_a, cap_a)) = publish_package_on_single_authority(
         &path.join("src/unit_tests/data/package_deny/a"),
         accounts[0].0,
         &accounts[0].1,
@@ -322,7 +322,7 @@ async fn test_package_denied() {
     )
     .await
     .unwrap();
-    let package_c_prime = upgrade_package_on_single_authority(
+    let (tx_c_prime, package_c_prime) = upgrade_package_on_single_authority(
         &path.join("src/unit_tests/data/package_deny/c"),
         accounts[0].0,
         &accounts[0].1,
@@ -335,7 +335,7 @@ async fn test_package_denied() {
     )
     .await
     .unwrap();
-    let package_b_prime = upgrade_package_on_single_authority(
+    let (tx_b_prime, package_b_prime) = upgrade_package_on_single_authority(
         &path.join("src/unit_tests/data/package_deny/b"),
         accounts[0].0,
         &accounts[0].1,
@@ -348,6 +348,17 @@ async fn test_package_denied() {
     )
     .await
     .unwrap();
+
+    let batch = state.get_cache_commit().build_db_batch(
+        state.epoch_store_for_testing().epoch(),
+        &[tx_c, tx_b, tx_a, tx_c_prime, tx_b_prime],
+    );
+
+    state.get_cache_commit().commit_transaction_outputs(
+        state.epoch_store_for_testing().epoch(),
+        batch,
+        &[tx_c, tx_b, tx_a, tx_c_prime, tx_b_prime],
+    );
 
     // Re-create the state such that we could deny package c.
     let state = reload_state_with_new_deny_config(

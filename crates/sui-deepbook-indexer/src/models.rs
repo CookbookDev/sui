@@ -2,21 +2,24 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use diesel::data_types::PgTimestamp;
-use diesel::{Identifiable, Insertable, Queryable, Selectable};
+use diesel::{Identifiable, Insertable, Queryable, QueryableByName, Selectable};
 
+use serde::Serialize;
 use sui_indexer_builder::{Task, LIVE_TASK_TARGET_CHECKPOINT};
 
 use crate::schema::{
-    balances, flashloans, order_fills, order_updates, pool_prices, progress_store, proposals,
-    rebates, stakes, sui_error_transactions, trade_params_update, votes,
+    balances, balances_summary, flashloans, order_fills, order_updates, pool_prices, pools,
+    progress_store, proposals, rebates, stakes, sui_error_transactions, trade_params_update, votes,
 };
 
 #[derive(Queryable, Selectable, Insertable, Identifiable, Debug)]
-#[diesel(table_name = order_updates, primary_key(digest))]
+#[diesel(table_name = order_updates, primary_key(event_digest))]
 pub struct OrderUpdate {
+    pub event_digest: String,
     pub digest: String,
     pub sender: String,
     pub checkpoint: i64,
+    pub checkpoint_timestamp_ms: i64,
     pub package: String,
     pub status: String,
     pub pool_id: String,
@@ -26,17 +29,20 @@ pub struct OrderUpdate {
     pub is_bid: bool,
     pub original_quantity: i64,
     pub quantity: i64,
+    pub filled_quantity: i64,
     pub onchain_timestamp: i64,
     pub trader: String,
     pub balance_manager_id: String,
 }
 
 #[derive(Queryable, Selectable, Insertable, Identifiable, Debug)]
-#[diesel(table_name = order_fills, primary_key(digest))]
+#[diesel(table_name = order_fills, primary_key(event_digest))]
 pub struct OrderFill {
+    pub event_digest: String,
     pub digest: String,
     pub sender: String,
     pub checkpoint: i64,
+    pub checkpoint_timestamp_ms: i64,
     pub package: String,
     pub pool_id: String,
     pub maker_order_id: String, // u128
@@ -45,7 +51,9 @@ pub struct OrderFill {
     pub taker_client_order_id: i64,
     pub price: i64,
     pub taker_fee: i64,
+    pub taker_fee_is_deep: bool,
     pub maker_fee: i64,
+    pub maker_fee_is_deep: bool,
     pub taker_is_bid: bool,
     pub base_quantity: i64,
     pub quote_quantity: i64,
@@ -54,12 +62,30 @@ pub struct OrderFill {
     pub onchain_timestamp: i64,
 }
 
+#[derive(Queryable)]
+pub struct OrderFillSummary {
+    pub pool_id: String,
+    pub maker_balance_manager_id: String,
+    pub taker_balance_manager_id: String,
+    pub quantity: i64,
+}
+
+#[derive(QueryableByName, Debug, Serialize)]
+#[diesel(table_name = balances_summary)]
+pub struct BalancesSummary {
+    pub asset: String,
+    pub amount: i64,
+    pub deposit: bool,
+}
+
 #[derive(Queryable, Selectable, Insertable, Identifiable, Debug)]
-#[diesel(table_name = flashloans, primary_key(digest))]
+#[diesel(table_name = flashloans, primary_key(event_digest))]
 pub struct Flashloan {
+    pub event_digest: String,
     pub digest: String,
     pub sender: String,
     pub checkpoint: i64,
+    pub checkpoint_timestamp_ms: i64,
     pub package: String,
     pub pool_id: String,
     pub borrow_quantity: i64,
@@ -68,11 +94,13 @@ pub struct Flashloan {
 }
 
 #[derive(Queryable, Selectable, Insertable, Identifiable, Debug)]
-#[diesel(table_name = pool_prices, primary_key(digest))]
+#[diesel(table_name = pool_prices, primary_key(event_digest))]
 pub struct PoolPrice {
+    pub event_digest: String,
     pub digest: String,
     pub sender: String,
     pub checkpoint: i64,
+    pub checkpoint_timestamp_ms: i64,
     pub package: String,
     pub target_pool: String,
     pub reference_pool: String,
@@ -80,11 +108,13 @@ pub struct PoolPrice {
 }
 
 #[derive(Queryable, Selectable, Insertable, Identifiable, Debug)]
-#[diesel(table_name = balances, primary_key(digest))]
+#[diesel(table_name = balances, primary_key(event_digest))]
 pub struct Balances {
+    pub event_digest: String,
     pub digest: String,
     pub sender: String,
     pub checkpoint: i64,
+    pub checkpoint_timestamp_ms: i64,
     pub package: String,
     pub balance_manager_id: String,
     pub asset: String,
@@ -93,12 +123,15 @@ pub struct Balances {
 }
 
 #[derive(Queryable, Selectable, Insertable, Identifiable, Debug)]
-#[diesel(table_name = proposals, primary_key(digest))]
+#[diesel(table_name = proposals, primary_key(event_digest))]
 pub struct Proposals {
+    pub event_digest: String,
     pub digest: String,
     pub sender: String,
     pub checkpoint: i64,
+    pub checkpoint_timestamp_ms: i64,
     pub package: String,
+    pub pool_id: String,
     pub balance_manager_id: String,
     pub epoch: i64,
     pub taker_fee: i64,
@@ -107,11 +140,13 @@ pub struct Proposals {
 }
 
 #[derive(Queryable, Selectable, Insertable, Identifiable, Debug)]
-#[diesel(table_name = rebates, primary_key(digest))]
+#[diesel(table_name = rebates, primary_key(event_digest))]
 pub struct Rebates {
+    pub event_digest: String,
     pub digest: String,
     pub sender: String,
     pub checkpoint: i64,
+    pub checkpoint_timestamp_ms: i64,
     pub package: String,
     pub pool_id: String,
     pub balance_manager_id: String,
@@ -120,11 +155,13 @@ pub struct Rebates {
 }
 
 #[derive(Queryable, Selectable, Insertable, Identifiable, Debug)]
-#[diesel(table_name = stakes, primary_key(digest))]
+#[diesel(table_name = stakes, primary_key(event_digest))]
 pub struct Stakes {
+    pub event_digest: String,
     pub digest: String,
     pub sender: String,
     pub checkpoint: i64,
+    pub checkpoint_timestamp_ms: i64,
     pub package: String,
     pub pool_id: String,
     pub balance_manager_id: String,
@@ -134,11 +171,13 @@ pub struct Stakes {
 }
 
 #[derive(Queryable, Selectable, Insertable, Identifiable, Debug)]
-#[diesel(table_name = trade_params_update, primary_key(digest))]
+#[diesel(table_name = trade_params_update, primary_key(event_digest))]
 pub struct TradeParamsUpdate {
+    pub event_digest: String,
     pub digest: String,
     pub sender: String,
     pub checkpoint: i64,
+    pub checkpoint_timestamp_ms: i64,
     pub package: String,
     pub pool_id: String,
     pub taker_fee: i64,
@@ -147,11 +186,13 @@ pub struct TradeParamsUpdate {
 }
 
 #[derive(Queryable, Selectable, Insertable, Identifiable, Debug)]
-#[diesel(table_name = votes, primary_key(digest))]
+#[diesel(table_name = votes, primary_key(event_digest))]
 pub struct Votes {
+    pub event_digest: String,
     pub digest: String,
     pub sender: String,
     pub checkpoint: i64,
+    pub checkpoint_timestamp_ms: i64,
     pub package: String,
     pub pool_id: String,
     pub balance_manager_id: String,
@@ -159,6 +200,24 @@ pub struct Votes {
     pub from_proposal_id: Option<String>,
     pub to_proposal_id: String,
     pub stake: i64,
+}
+
+#[derive(Queryable, Selectable, Insertable, Identifiable, Debug, Serialize)]
+#[diesel(table_name = pools, primary_key(pool_id))]
+pub struct Pools {
+    pub pool_id: String,
+    pub pool_name: String,
+    pub base_asset_id: String,
+    pub base_asset_decimals: i16,
+    pub base_asset_symbol: String,
+    pub base_asset_name: String,
+    pub quote_asset_id: String,
+    pub quote_asset_decimals: i16,
+    pub quote_asset_symbol: String,
+    pub quote_asset_name: String,
+    pub min_size: i32,
+    pub lot_size: i32,
+    pub tick_size: i32,
 }
 
 #[derive(Queryable, Selectable, Insertable, Identifiable, Debug)]

@@ -135,9 +135,12 @@ pub enum Ability {
 // Types
 //**************************************************************************************************
 
+/// The type of a single value coupled with source location information.
+pub type Type = Spanned<Type_>;
+
 /// The type of a single value
 #[derive(Debug, PartialEq, Clone)]
-pub enum Type {
+pub enum Type_ {
     /// `address`
     Address,
     /// `signer`
@@ -366,6 +369,8 @@ pub enum FunctionBody {
 /// A Move function/procedure
 #[derive(PartialEq, Debug, Clone)]
 pub struct Function_ {
+    /// Location of the whole function
+    pub loc: Loc,
     /// The visibility
     pub visibility: FunctionVisibility,
     /// Is entry function
@@ -719,6 +724,7 @@ pub enum Bytecode_ {
     ErrorConstant {
         line_number: u16,
         constant: Option<ConstantName>,
+        error_code: Option<u8>,
     },
     PackVariant(DatatypeName, VariantName, Vec<Type>),
     UnpackVariant(DatatypeName, VariantName, Vec<Type>, UnpackType),
@@ -819,33 +825,6 @@ impl Ability {
     pub const DROP: &'static str = "drop";
     pub const STORE: &'static str = "store";
     pub const KEY: &'static str = "key";
-}
-
-impl Type {
-    /// Creates a new struct type
-    pub fn r#struct(ident: QualifiedDatatypeIdent, type_actuals: Vec<Type>) -> Type {
-        Type::Datatype(ident, type_actuals)
-    }
-
-    /// Creates a new reference type from its mutability and underlying type
-    pub fn reference(is_mutable: bool, t: Type) -> Type {
-        Type::Reference(is_mutable, Box::new(t))
-    }
-
-    /// Creates a new address type
-    pub fn address() -> Type {
-        Type::Address
-    }
-
-    /// Creates a new u64 type
-    pub fn u64() -> Type {
-        Type::U64
-    }
-
-    /// Creates a new bool type
-    pub fn bool() -> Type {
-        Type::Bool
-    }
 }
 
 impl QualifiedDatatypeIdent {
@@ -956,6 +935,7 @@ impl Function_ {
     /// Creates a new function declaration from the components of the function
     /// See the declaration of the struct `Function` for more details
     pub fn new(
+        loc: Loc,
         visibility: FunctionVisibility,
         is_entry: bool,
         formals: Vec<(Var, Type)>,
@@ -965,6 +945,7 @@ impl Function_ {
     ) -> Self {
         let signature = FunctionSignature::new(formals, return_type, type_parameters);
         Function_ {
+            loc,
             visibility,
             is_entry,
             signature,
@@ -1440,24 +1421,24 @@ fn format_struct_type_formals(formals: &[DatatypeTypeParameter]) -> String {
     }
 }
 
-impl fmt::Display for Type {
+impl fmt::Display for Type_ {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Type::U8 => write!(f, "u8"),
-            Type::U16 => write!(f, "u16"),
-            Type::U32 => write!(f, "u32"),
-            Type::U64 => write!(f, "u64"),
-            Type::U128 => write!(f, "u128"),
-            Type::U256 => write!(f, "u256"),
-            Type::Bool => write!(f, "bool"),
-            Type::Address => write!(f, "address"),
-            Type::Signer => write!(f, "signer"),
-            Type::Vector(ty) => write!(f, "vector<{}>", ty),
-            Type::Datatype(ident, tys) => write!(f, "{}{}", ident, format_type_actuals(tys)),
-            Type::Reference(is_mutable, t) => {
+            Type_::U8 => write!(f, "u8"),
+            Type_::U16 => write!(f, "u16"),
+            Type_::U32 => write!(f, "u32"),
+            Type_::U64 => write!(f, "u64"),
+            Type_::U128 => write!(f, "u128"),
+            Type_::U256 => write!(f, "u256"),
+            Type_::Bool => write!(f, "bool"),
+            Type_::Address => write!(f, "address"),
+            Type_::Signer => write!(f, "signer"),
+            Type_::Vector(ty) => write!(f, "vector<{}>", ty),
+            Type_::Datatype(ident, tys) => write!(f, "{}{}", ident, format_type_actuals(tys)),
+            Type_::Reference(is_mutable, t) => {
                 write!(f, "&{}{}", if *is_mutable { "mut " } else { "" }, t)
             }
-            Type::TypeParameter(s) => write!(f, "{}", s),
+            Type_::TypeParameter(s) => write!(f, "{}", s),
         }
     }
 }
@@ -1810,10 +1791,12 @@ impl fmt::Display for Bytecode_ {
             Bytecode_::ErrorConstant {
                 line_number,
                 constant,
+                error_code,
             } => {
                 write!(
                     f,
-                    "ErrorConstant {}:{}",
+                    "ErrorConstant {}:{}:{}",
+                    error_code.unwrap_or(0),
                     line_number,
                     constant
                         .as_ref()

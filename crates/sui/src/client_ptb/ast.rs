@@ -1,15 +1,16 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
-use move_command_line_common::{
+use move_core_types::parsing::{
     address::{NumericalAddress, ParsedAddress},
     types::{ParsedFqName, ParsedModuleId, ParsedStructType, ParsedType},
 };
 use move_core_types::runtime_value::MoveValue;
 use sui_types::{
     base_types::{ObjectID, RESOLVED_ASCII_STR, RESOLVED_STD_OPTION, RESOLVED_UTF8_STR},
+    id::RESOLVED_SUI_ID,
     Identifier, TypeTag,
 };
 
@@ -35,6 +36,7 @@ pub const SUMMARY: &str = "summary";
 pub const GAS_COIN: &str = "gas-coin";
 pub const JSON: &str = "json";
 pub const DRY_RUN: &str = "dry-run";
+pub const DEV_INSPECT: &str = "dev-inspect";
 pub const SERIALIZE_UNSIGNED: &str = "serialize-unsigned-transaction";
 pub const SERIALIZE_SIGNED: &str = "serialize-signed-transaction";
 
@@ -74,6 +76,7 @@ pub const COMMANDS: &[&str] = &[
     GAS_COIN,
     JSON,
     DRY_RUN,
+    DEV_INSPECT,
     SERIALIZE_UNSIGNED,
     SERIALIZE_SIGNED,
 ];
@@ -111,7 +114,9 @@ pub struct ProgramMetadata {
     pub gas_object_id: Option<Spanned<ObjectID>>,
     pub json_set: bool,
     pub dry_run_set: bool,
+    pub dev_inspect_set: bool,
     pub gas_budget: Option<Spanned<u64>>,
+    pub mvr_names: BTreeMap<String, Span>,
 }
 
 /// A parsed module access consisting of the address, module name, and function name.
@@ -198,6 +203,30 @@ impl Argument {
                 } =>
             {
                 MoveValue::Vector(s.bytes().map(MoveValue::U8).collect::<Vec<_>>())
+            }
+            (Argument::Address(a), TypeTag::Struct(stag))
+                if (
+                    &stag.address,
+                    stag.module.as_ident_str(),
+                    stag.name.as_ident_str(),
+                ) == RESOLVED_SUI_ID =>
+            {
+                MoveValue::Address(a.into_inner())
+            }
+            (Argument::Option(sp!(loc, o)), TypeTag::Vector(ty)) => {
+                if let Some(v) = o {
+                    let v = v
+                        .as_ref()
+                        .checked_to_pure_move_value(*loc, ty)
+                        .map_err(|e| {
+                            e.with_help(
+                                "Literal option values cannot contain object values.".to_string(),
+                            )
+                        })?;
+                    MoveValue::Vector(vec![v])
+                } else {
+                    MoveValue::Vector(vec![])
+                }
             }
             (Argument::Option(sp!(loc, o)), TypeTag::Struct(stag))
                 if (
@@ -430,7 +459,7 @@ impl fmt::Display for ParsedPTBCommand {
 
 struct TyDisplay<'a>(&'a ParsedType);
 
-impl<'a> fmt::Display for TyDisplay<'a> {
+impl fmt::Display for TyDisplay<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use ParsedType::*;
         match self.0 {

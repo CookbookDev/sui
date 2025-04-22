@@ -12,7 +12,6 @@ const concepts = [
 			id: 'concepts/app-devs',
 		},
 		items: [
-			'concepts/graphql-rpc',
 			{
 				type: 'category',
 				label: 'Object Model',
@@ -37,15 +36,6 @@ const concepts = [
 					},
 					{
 						type: 'category',
-						label: 'Dynamic Fields',
-						link: {
-							type: 'doc',
-							id: 'concepts/dynamic-fields',
-						},
-						items: ['concepts/dynamic-fields/tables-bags'],
-					},
-					{
-						type: 'category',
 						label: 'Transfers',
 						link: {
 							type: 'doc',
@@ -53,7 +43,6 @@ const concepts = [
 						},
 						items: ['concepts/transfers/custom-rules', 'concepts/transfers/transfer-to-object'],
 					},
-					'concepts/events',
 					'concepts/versioning',
 				],
 			},
@@ -65,11 +54,6 @@ const concepts = [
 					id: 'concepts/sui-move-concepts',
 				},
 				items: [
-					'concepts/sui-move-concepts/strings',
-					'concepts/sui-move-concepts/collections',
-					'concepts/sui-move-concepts/init',
-					'concepts/sui-move-concepts/entry-functions',
-					'concepts/sui-move-concepts/one-time-witness',
 					{
 						type: 'category',
 						label: 'Packages',
@@ -82,6 +66,15 @@ const concepts = [
 							'concepts/sui-move-concepts/packages/custom-policies',
 							'concepts/sui-move-concepts/packages/automated-address-management',
 						],
+					},
+					{
+						type: 'category',
+						label: 'Dynamic Fields',
+						link: {
+							type: 'doc',
+							id: 'concepts/dynamic-fields',
+						},
+						items: ['concepts/dynamic-fields/tables-bags'],
 					},
 					'concepts/sui-move-concepts/conventions',
 				],
@@ -99,6 +92,9 @@ const concepts = [
 					'concepts/transactions/gas-smashing',
 				],
 			},
+			'concepts/grpc-overview',
+			'concepts/graphql-rpc',
+			'concepts/gaming'
 		],
 	},
 	{
@@ -125,6 +121,7 @@ const concepts = [
 				],
 			},
 			'concepts/cryptography/zklogin',
+			'concepts/cryptography/passkeys',
 			'concepts/cryptography/system/checkpoint-verification',
 			/*{
 				type: 'category',
@@ -169,14 +166,11 @@ const concepts = [
 			id: 'concepts/tokenomics',
 		},
 		items: [
-			'concepts/tokenomics/proof-of-stake',
-			'concepts/tokenomics/validators-staking',
 			'concepts/tokenomics/staking-unstaking',
-			'concepts/tokenomics/sui-coin',
 			'concepts/tokenomics/sui-bridging',
-			'concepts/tokenomics/storage-fund',
 			'concepts/tokenomics/gas-pricing',
 			'concepts/tokenomics/gas-in-sui',
+			'concepts/tokenomics/vesting-strategies'
 		],
 	},
 	'concepts/research-papers',

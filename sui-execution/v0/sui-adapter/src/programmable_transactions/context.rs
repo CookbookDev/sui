@@ -11,7 +11,7 @@ mod checked {
         sync::Arc,
     };
 
-    use crate::adapter::{missing_unwrapped_msg, new_native_extensions};
+    use crate::adapter::new_native_extensions;
     use crate::error::convert_vm_error;
     use crate::execution_mode::ExecutionMode;
     use crate::execution_value::{
@@ -199,21 +199,21 @@ mod checked {
 
             // Set the profiler if in CLI
             #[skip_checked_arithmetic]
-            move_vm_profiler::gas_profiler_feature_enabled! {
+            move_vm_profiler::tracing_feature_enabled! {
                 use move_vm_profiler::GasProfiler;
                 use move_vm_types::gas::GasMeter;
+                use crate::gas_meter::SuiGasMeter;
 
                 let tx_digest = tx_context.digest();
-                let remaining_gas: u64 =
-                    move_vm_types::gas::GasMeter::remaining_gas(gas_charger.move_gas_status())
-                        .into();
-                gas_charger
-                    .move_gas_status_mut()
-                    .set_profiler(GasProfiler::init(
-                        &vm.config().profiler_config,
-                        format!("{}", tx_digest),
-                        remaining_gas,
-                    ));
+                let remaining_gas: u64 = move_vm_types::gas::GasMeter::remaining_gas(&SuiGasMeter(
+                    gas_charger.move_gas_status_mut(),
+                ))
+                .into();
+                SuiGasMeter(gas_charger.move_gas_status_mut()).set_profiler(GasProfiler::init(
+                    &vm.config().profiler_config,
+                    format!("{}", tx_digest),
+                    remaining_gas,
+                ));
             }
 
             Ok(Self {
@@ -608,7 +608,7 @@ mod checked {
                     return Ok(());
                 };
                 if *is_mutable_input {
-                    add_additional_write(&mut additional_writes, *owner, object_value)?;
+                    add_additional_write(&mut additional_writes, owner.clone(), object_value)?;
                 }
                 Ok(())
             };
@@ -816,15 +816,13 @@ mod checked {
                         if protocol_config.simplified_unwrap_then_delete() {
                             DeleteKindWithOldVersion::UnwrapThenDelete
                         } else {
-                            let old_version = match state_view
-                                .get_latest_parent_entry_ref_deprecated(id)
-                            {
-                                Ok(Some((_, previous_version, _))) => previous_version,
-                                // This object was not created this transaction but has never existed in
-                                // storage, skip it.
-                                Ok(None) => continue,
-                                Err(_) => invariant_violation!("{}", missing_unwrapped_msg(&id)),
-                            };
+                            let old_version =
+                                match state_view.get_latest_parent_entry_ref_deprecated(id) {
+                                    Some((_, previous_version, _)) => previous_version,
+                                    // This object was not created this transaction but has never existed in
+                                    // storage, skip it.
+                                    None => continue,
+                                };
                             DeleteKindWithOldVersion::UnwrapThenDeleteDEPRECATED(old_version)
                         }
                     }
@@ -948,7 +946,7 @@ mod checked {
         }
     }
 
-    impl<'vm, 'state, 'a> TypeTagResolver for ExecutionContext<'vm, 'state, 'a> {
+    impl TypeTagResolver for ExecutionContext<'_, '_, '_> {
         fn get_type_tag(&self, type_: &Type) -> Result<TypeTag, ExecutionError> {
             self.session
                 .get_type_tag(type_)
@@ -1186,13 +1184,16 @@ mod checked {
                 // protected by transaction input checker
                 invariant_violation!("ObjectOwner objects cannot be input")
             }
+            Owner::ConsensusV2 { .. } => {
+                unimplemented!("ConsensusV2 does not exist for this execution version")
+            }
         };
-        let owner = obj.owner;
+        let owner = obj.owner.clone();
         let version = obj.version();
         let object_metadata = InputObjectMetadata::InputObject {
             id,
             is_mutable_input,
-            owner,
+            owner: owner.clone(),
             version,
         };
         let obj_value = value_from_object(vm, session, obj)?;
@@ -1221,7 +1222,7 @@ mod checked {
         Ok(InputValue::new_object(object_metadata, obj_value))
     }
 
-    /// Load an a CallArg, either an object or a raw set of BCS bytes
+    /// Load a CallArg, either an object or a raw set of BCS bytes
     fn load_call_arg<'vm, 'state>(
         vm: &'vm MoveVM,
         state_view: &'state dyn ExecutionState,

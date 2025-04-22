@@ -9,10 +9,10 @@ use std::{
     path::PathBuf,
 };
 use sui_bridge::config::BridgeNodeConfig;
-use sui_bridge::metrics::start_metrics_push_task;
 use sui_bridge::node::run_bridge_node;
 use sui_bridge::server::BridgeNodePublicMetadata;
 use sui_config::Config;
+use sui_metrics_push_client::start_metrics_push_task;
 use tracing::info;
 
 // Define the `GIT_REVISION` and `VERSION` consts
@@ -46,14 +46,16 @@ async fn main() -> anyhow::Result<()> {
         .with_prom_registry(&prometheus_registry)
         .init();
 
-    let metadata =
-        BridgeNodePublicMetadata::new(VERSION.into(), config.metrics_key_pair.public().clone());
+    let metadata = BridgeNodePublicMetadata::new(VERSION, config.metrics_key_pair.public().clone());
 
-    start_metrics_push_task(
-        &config.metrics,
-        config.metrics_key_pair.copy(),
-        registry_service.clone(),
-    );
+    if let Some(metrics_config) = &config.metrics {
+        start_metrics_push_task(
+            metrics_config.push_interval_seconds,
+            metrics_config.push_url.clone(),
+            config.metrics_key_pair.copy(),
+            registry_service.clone(),
+        );
+    }
     Ok(run_bridge_node(config, metadata, prometheus_registry)
         .await?
         .await?)

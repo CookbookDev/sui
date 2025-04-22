@@ -15,7 +15,7 @@ use super::display::{Display, DisplayEntry};
 use super::dynamic_field::{DynamicField, DynamicFieldName};
 use super::move_object::MoveObject;
 use super::move_package::MovePackage;
-use super::owner::OwnerImpl;
+use super::owner::{Authenticator, OwnerImpl};
 use super::stake::StakedSui;
 use super::sui_address::addr;
 use super::suins_registration::{DomainFormat, SuinsRegistration};
@@ -30,19 +30,21 @@ use crate::data::package_resolver::PackageResolver;
 use crate::data::{DataLoader, Db, DbConnection, QueryExecutor};
 use crate::error::Error;
 use crate::raw_query::RawQuery;
+use crate::types::address::Address;
 use crate::types::base64::Base64;
 use crate::types::intersect;
 use crate::{filter, or_filter};
 use async_graphql::connection::{CursorType, Edge};
 use async_graphql::dataloader::Loader;
 use async_graphql::{connection::Connection, *};
-use diesel::{BoolExpressionMethods, ExpressionMethods, JoinOnDsl, QueryDsl, SelectableHelper};
+use diesel::{BoolExpressionMethods, ExpressionMethods, QueryDsl, SelectableHelper};
 use diesel_async::scoped_futures::ScopedFutureExt;
 use move_core_types::annotated_value::{MoveStruct, MoveTypeLayout};
 use move_core_types::language_storage::StructTag;
 use serde::{Deserialize, Serialize};
-use sui_indexer::models::objects::StoredHistoryObject;
-use sui_indexer::schema::{objects_history, objects_version};
+use sui_indexer::models::obj_indices::StoredObjectVersion;
+use sui_indexer::models::objects::{StoredFullHistoryObject, StoredHistoryObject};
+use sui_indexer::schema::{full_objects_history, objects_version};
 use sui_indexer::types::ObjectStatus as NativeObjectStatus;
 use sui_indexer::types::OwnerType;
 use sui_types::object::bounded_visitor::BoundedVisitor;
@@ -54,6 +56,7 @@ use sui_types::TypeTag;
 #[derive(Clone, Debug)]
 pub(crate) struct Object {
     pub address: SuiAddress,
+    pub version: u64,
     pub kind: ObjectKind,
     /// The checkpoint sequence number at which this was viewed at.
     pub checkpoint_viewed_at: u64,
@@ -82,9 +85,8 @@ pub(crate) enum ObjectKind {
     NotIndexed(NativeObject),
     /// An object fetched from the index.
     Indexed(NativeObject, StoredHistoryObject),
-    /// The object is wrapped or deleted and only partial information can be loaded from the
-    /// indexer. The `u64` is the version of the object.
-    WrappedOrDeleted(u64),
+    /// An object in the bcs serialized form.
+    Serialized(Vec<u8>),
 }
 
 #[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
@@ -95,9 +97,6 @@ pub enum ObjectStatus {
     NotIndexed,
     /// The object is fetched from the index.
     Indexed,
-    /// The object is deleted or wrapped and only partial information can be loaded from the
-    /// indexer.
-    WrappedOrDeleted,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, InputObject)]
@@ -115,14 +114,11 @@ pub(crate) struct ObjectRef {
 ///
 /// - Type matches the `type` filter,
 /// - AND, whose owner matches the `owner` filter,
-/// - AND, whose ID is in `objectIds` OR whose ID and version is in `objectKeys`.
+/// - AND, whose ID is in `objectIds`.
 #[derive(InputObject, Default, Debug, Clone, Eq, PartialEq)]
 pub(crate) struct ObjectFilter {
-    /// This field is used to specify the type of objects that should be included in the query
-    /// results.
-    ///
-    /// Objects can be filtered by their type's package, package::module, or their fully qualified
-    /// type name.
+    /// Filter objects by their type's `package`, `package::module`, or their fully qualified type
+    /// name.
     ///
     /// Generic types can be queried by either the generic type name, e.g. `0x2::coin::Coin`, or by
     /// the full type name, such as `0x2::coin::Coin<0x2::sui::SUI>`.
@@ -133,9 +129,6 @@ pub(crate) struct ObjectFilter {
 
     /// Filter for live objects by their IDs.
     pub object_ids: Option<Vec<SuiAddress>>,
-
-    /// Filter for live or potentially historical objects by their ID and version.
-    pub object_keys: Option<Vec<ObjectKey>>,
 }
 
 #[derive(InputObject, Debug, Clone, Eq, PartialEq)]
@@ -151,6 +144,7 @@ pub(crate) enum ObjectOwner {
     Shared(Shared),
     Parent(Parent),
     Address(AddressOwner),
+    ConsensusV2(ConsensusV2),
 }
 
 /// An immutable object is an object that can't be mutated, transferred, or deleted.
@@ -169,11 +163,13 @@ pub(crate) struct Shared {
 }
 
 /// If the object's owner is a Parent, this object is part of a dynamic field (it is the value of
-/// the dynamic field, or the intermediate Field object itself). Also note that if the owner
-/// is a parent, then it's guaranteed to be an object.
+/// the dynamic field, or the intermediate Field object itself), and it is owned by another object.
+///
+/// Although its owner is guaranteed to be an object, it is exposed as an Owner, as the parent
+/// object could be wrapped and therefore not directly accessible.
 #[derive(SimpleObject, Clone)]
 pub(crate) struct Parent {
-    parent: Option<Object>,
+    parent: Option<Owner>,
 }
 
 /// An address-owned object is owned by a specific 32-byte address that is
@@ -182,6 +178,15 @@ pub(crate) struct Parent {
 #[derive(SimpleObject, Clone)]
 pub(crate) struct AddressOwner {
     owner: Option<Owner>,
+}
+
+/// A ConsensusV2 object is an object that is automatically versioned by the consensus protocol
+/// and allows different authentication modes based on the chosen authenticator.
+/// (Initially, only single-owner authentication is supported.)
+#[derive(SimpleObject, Clone)]
+pub(crate) struct ConsensusV2 {
+    start_version: UInt53,
+    authenticator: Option<Authenticator>,
 }
 
 /// Filter for a point query of an Object.
@@ -312,6 +317,14 @@ struct LatestAtKey {
     checkpoint_viewed_at: u64,
 }
 
+/// `DataLoader` key for fetching an `Object` at a specific version.
+/// This does not have any consistency constraints.
+#[derive(Copy, Clone, Hash, Eq, PartialEq, Debug)]
+struct PointLookupKey {
+    id: SuiAddress,
+    version: u64,
+}
+
 /// An object in Sui is a package (set of Move bytecode modules) or object (typed data structure
 /// with fields) with additional metadata detailing its id, version, transaction digest, owner
 /// field indicating how this object can be accessed.
@@ -437,8 +450,8 @@ impl Object {
 
     /// The owner type of this object: Immutable, Shared, Parent, Address
     /// Immutable and Shared Objects do not have owners.
-    pub(crate) async fn owner(&self, ctx: &Context<'_>) -> Option<ObjectOwner> {
-        ObjectImpl(self).owner(ctx).await
+    pub(crate) async fn owner(&self) -> Option<ObjectOwner> {
+        ObjectImpl(self).owner().await
     }
 
     /// The transaction block that created this version of the object.
@@ -565,7 +578,7 @@ impl Object {
 
 impl ObjectImpl<'_> {
     pub(crate) async fn version(&self) -> UInt53 {
-        self.0.version_impl().into()
+        self.0.version.into()
     }
 
     pub(crate) async fn status(&self) -> ObjectStatus {
@@ -578,14 +591,14 @@ impl ObjectImpl<'_> {
             .map(|native| native.digest().base58_encode())
     }
 
-    pub(crate) async fn owner(&self, ctx: &Context<'_>) -> Option<ObjectOwner> {
+    pub(crate) async fn owner(&self) -> Option<ObjectOwner> {
         use NativeOwner as O;
 
         let native = self.0.native_impl()?;
 
-        match native.owner {
+        match &native.owner {
             O::AddressOwner(address) => {
-                let address = SuiAddress::from(address);
+                let address = SuiAddress::from(*address);
                 Some(ObjectOwner::Address(AddressOwner {
                     owner: Some(Owner {
                         address,
@@ -596,21 +609,29 @@ impl ObjectImpl<'_> {
             }
             O::Immutable => Some(ObjectOwner::Immutable(Immutable { dummy: None })),
             O::ObjectOwner(address) => {
-                let parent = Object::query(
-                    ctx,
-                    address.into(),
-                    Object::latest_at(self.0.checkpoint_viewed_at),
-                )
-                .await
-                .ok()
-                .flatten();
-
-                Some(ObjectOwner::Parent(Parent { parent }))
+                let address = SuiAddress::from(*address);
+                Some(ObjectOwner::Parent(Parent {
+                    parent: Some(Owner {
+                        address,
+                        checkpoint_viewed_at: self.0.checkpoint_viewed_at,
+                        root_version: Some(self.0.root_version()),
+                    }),
+                }))
             }
             O::Shared {
                 initial_shared_version,
             } => Some(ObjectOwner::Shared(Shared {
                 initial_shared_version: initial_shared_version.value().into(),
+            })),
+            O::ConsensusV2 {
+                start_version,
+                authenticator,
+            } => Some(ObjectOwner::ConsensusV2(ConsensusV2 {
+                start_version: start_version.value().into(),
+                authenticator: Some(Authenticator::SingleOwner(Address {
+                    address: SuiAddress::from(*authenticator.as_single_owner()),
+                    checkpoint_viewed_at: self.0.checkpoint_viewed_at,
+                })),
             })),
         }
     }
@@ -624,9 +645,12 @@ impl ObjectImpl<'_> {
         };
         let digest = native.previous_transaction;
 
-        TransactionBlock::query(ctx, digest.into(), self.0.checkpoint_viewed_at)
-            .await
-            .extend()
+        TransactionBlock::query(
+            ctx,
+            TransactionBlock::by_digest(digest.into(), self.0.checkpoint_viewed_at),
+        )
+        .await
+        .extend()
     }
 
     pub(crate) async fn storage_rebate(&self) -> Option<BigInt> {
@@ -650,7 +674,7 @@ impl ObjectImpl<'_> {
         let Some(filter) = filter
             .unwrap_or_default()
             .intersect(TransactionBlockFilter {
-                recv_address: Some(self.0.address),
+                affected_address: Some(self.0.address),
                 ..Default::default()
             })
         else {
@@ -665,12 +689,7 @@ impl ObjectImpl<'_> {
     pub(crate) async fn bcs(&self) -> Result<Option<Base64>> {
         use ObjectKind as K;
         Ok(match &self.0.kind {
-            K::WrappedOrDeleted(_) => None,
-            // WrappedOrDeleted objects are also read from the historical objects table, and they do
-            // not have a serialized object, so the column is also nullable for stored historical
-            // objects.
             K::Indexed(_, stored) => stored.serialized_object.as_ref().map(Base64::from),
-
             K::NotIndexed(native) => {
                 let bytes = bcs::to_bytes(native)
                     .map_err(|e| {
@@ -682,6 +701,7 @@ impl ObjectImpl<'_> {
                     .extend()?;
                 Some(Base64::from(&bytes))
             }
+            K::Serialized(bytes) => Some(Base64::from(bytes)),
         })
     }
 
@@ -734,27 +754,40 @@ impl Object {
         let root_version = root_version.unwrap_or_else(|| version_for_dynamic_fields(&native));
         Object {
             address,
+            version: native.version().value(),
             kind: ObjectKind::NotIndexed(native),
             checkpoint_viewed_at,
             root_version,
         }
     }
 
-    pub(crate) fn native_impl(&self) -> Option<&NativeObject> {
-        use ObjectKind as K;
-
-        match &self.kind {
-            K::NotIndexed(native) | K::Indexed(native, _) => Some(native),
-            K::WrappedOrDeleted(_) => None,
-        }
+    /// Creates a ObjectKind::Serialized object from `SerializedObject` type,
+    /// which is an optional BCS serialized object.
+    /// If the serialized object is None, then the object is marked as WrappedOrDeleted.
+    /// The `checkpoint_viewed_at` is the checkpoint sequence number at which this object was viewed.
+    /// The `root_version` is the root parent object version for dynamic fields.
+    pub(crate) fn new_serialized(
+        object_id: SuiAddress,
+        version: u64,
+        serialized: Option<Vec<u8>>,
+        checkpoint_viewed_at: u64,
+        root_version: u64,
+    ) -> Option<Self> {
+        serialized.map(|bytes| Self {
+            address: object_id,
+            version,
+            kind: ObjectKind::Serialized(bytes),
+            checkpoint_viewed_at,
+            root_version,
+        })
     }
 
-    pub(crate) fn version_impl(&self) -> u64 {
+    pub(crate) fn native_impl(&self) -> Option<NativeObject> {
         use ObjectKind as K;
 
         match &self.kind {
-            K::NotIndexed(native) | K::Indexed(native, _) => native.version().value(),
-            K::WrappedOrDeleted(object_version) => *object_version,
+            K::NotIndexed(native) | K::Indexed(native, _) => Some(native.clone()),
+            K::Serialized(bytes) => bcs::from_bytes(bytes).ok(),
         }
     }
 
@@ -763,6 +796,34 @@ impl Object {
     /// Check [`Object::root_version`] for details.
     pub(crate) fn root_version(&self) -> u64 {
         self.root_version
+    }
+
+    /// Fetch objects by their id and version. If you need to query for live objects, use the
+    /// `objects` field.
+    pub(crate) async fn query_many(
+        ctx: &Context<'_>,
+        keys: Vec<ObjectKey>,
+        checkpoint_viewed_at: u64,
+    ) -> Result<Vec<Option<Self>>, Error> {
+        let DataLoader(loader) = &ctx.data_unchecked();
+
+        let keys: Vec<_> = keys
+            .into_iter()
+            .map(|key| PointLookupKey {
+                id: key.object_id,
+                version: key.version.into(),
+            })
+            .collect();
+
+        let data = loader.load_many(keys.clone()).await?;
+        Ok(keys
+            .into_iter()
+            .map(|k| {
+                data.get(&k).cloned().and_then(|bcs| {
+                    Object::new_serialized(k.id, k.version, bcs, checkpoint_viewed_at, k.version)
+                })
+            })
+            .collect())
     }
 
     /// Query the database for a `page` of objects, optionally `filter`-ed.
@@ -974,17 +1035,15 @@ impl Object {
                     root_version.unwrap_or_else(|| version_for_dynamic_fields(&native_object));
                 Ok(Self {
                     address,
+                    version: history_object.object_version as u64,
                     kind: ObjectKind::Indexed(native_object, history_object),
                     checkpoint_viewed_at,
                     root_version,
                 })
             }
-            NativeObjectStatus::WrappedOrDeleted => Ok(Self {
-                address,
-                kind: ObjectKind::WrappedOrDeleted(history_object.object_version as u64),
-                checkpoint_viewed_at,
-                root_version: history_object.object_version as u64,
-            }),
+            NativeObjectStatus::WrappedOrDeleted => Err(Error::Internal(
+                "Wrapped or deleted objects should not be loaded from DB.".to_string(),
+            )),
         }
     }
 }
@@ -1012,77 +1071,19 @@ impl ObjectFilter {
             };
         }
 
-        // Treat `object_ids` and `object_keys` as a single filter on IDs, and optionally versions,
-        // and compute the intersection of that.
-        let keys = intersect::field(self.keys(), other.keys(), |k, l| {
-            let mut combined = BTreeMap::new();
+        let object_ids = intersect::field(self.object_ids, other.object_ids, |a, b| {
+            let a = BTreeSet::from_iter(a);
+            let b = BTreeSet::from_iter(b);
 
-            for (id, v) in k {
-                if let Some(w) = l.get(&id).copied() {
-                    combined.insert(id, intersect::field(v, w, intersect::by_eq)?);
-                }
-            }
-
-            // If the intersection is empty, it means, there were some ID or Key filters in both
-            // `self` and `other`, but they don't overlap, so the final result is inconsistent.
-            (!combined.is_empty()).then_some(combined)
+            let intersection: Vec<_> = a.intersection(&b).cloned().collect();
+            (!intersection.is_empty()).then_some(intersection)
         })?;
-
-        // Extract the ID and Key filters back out. At this point, we know that if there were ID/Key
-        // filters in both `self` and `other`, then they intersected to form a consistent set of
-        // constraints, so it is safe to interpret the lack of any ID/Key filters respectively as a
-        // lack of that kind of constraint, rather than a constraint on the empty set.
-
-        let object_ids = {
-            let partition: Vec<_> = keys
-                .iter()
-                .flatten()
-                .filter_map(|(id, v)| v.is_none().then_some(*id))
-                .collect();
-
-            (!partition.is_empty()).then_some(partition)
-        };
-
-        let object_keys = {
-            let partition: Vec<_> = keys
-                .iter()
-                .flatten()
-                .filter_map(|(id, v)| {
-                    Some(ObjectKey {
-                        object_id: *id,
-                        version: (*v)?.into(),
-                    })
-                })
-                .collect();
-
-            (!partition.is_empty()).then_some(partition)
-        };
 
         Some(Self {
             type_: intersect!(type_, TypeFilter::intersect)?,
             owner: intersect!(owner, intersect::by_eq)?,
             object_ids,
-            object_keys,
         })
-    }
-
-    /// Extract the Object ID and Key filters into one combined map from Object IDs in this filter,
-    /// to the versions they should have (or None if the filter mentions the ID but no version for
-    /// it).
-    fn keys(&self) -> Option<BTreeMap<SuiAddress, Option<u64>>> {
-        if self.object_keys.is_none() && self.object_ids.is_none() {
-            return None;
-        }
-
-        Some(BTreeMap::from_iter(
-            self.object_keys
-                .iter()
-                .flatten()
-                .map(|key| (key.object_id, Some(key.version.into())))
-                // Chain ID filters after Key filters so if there is overlap, we overwrite the key
-                // filter with the ID filter.
-                .chain(self.object_ids.iter().flatten().map(|id| (*id, None))),
-        ))
     }
 
     /// Applies ObjectFilter to the input `RawQuery` and returns a new `RawQuery`.
@@ -1105,29 +1106,6 @@ impl ObjectFilter {
                     )
                     .unwrap();
                     prefix = ", ";
-                }
-                inner.push(')');
-                query = or_filter!(query, inner);
-            }
-        }
-
-        if let Some(object_keys) = &self.object_keys {
-            // Maximally strict - match a vec of 0 elements
-            if object_keys.is_empty() {
-                query = or_filter!(query, "1=0");
-            } else {
-                let mut inner = String::new();
-                let mut prefix = "(";
-                for ObjectKey { object_id, version } in object_keys {
-                    // SAFETY: Writing to a `String` cannot fail.
-                    write!(
-                        &mut inner,
-                        "{prefix}(object_id = '\\x{}'::bytea AND object_version = {})",
-                        hex::encode(object_id.into_vec()),
-                        version
-                    )
-                    .unwrap();
-                    prefix = " OR ";
                 }
                 inner.push(')');
                 query = or_filter!(query, inner);
@@ -1225,29 +1203,30 @@ impl Loader<HistoricalKey> for Db {
     type Error = Error;
 
     async fn load(&self, keys: &[HistoricalKey]) -> Result<HashMap<HistoricalKey, Object>, Error> {
-        use objects_history::dsl as h;
         use objects_version::dsl as v;
+
+        if keys.is_empty() {
+            return Ok(HashMap::new());
+        }
 
         let id_versions: BTreeSet<_> = keys
             .iter()
             .map(|key| (key.id.into_vec(), key.version as i64))
             .collect();
 
-        let objects: Vec<StoredHistoryObject> = self
+        // Maps from (object_id, version) to sequence_number in the object_versions table.
+        let object_versions: HashMap<_, _> = self
             .execute(move |conn| {
                 async {
                     conn.results(move || {
-                        let mut query = h::objects_history
-                            .inner_join(
-                                v::objects_version.on(v::cp_sequence_number
-                                    .eq(h::checkpoint_sequence_number)
-                                    .and(v::object_id.eq(h::object_id))
-                                    .and(v::object_version.eq(h::object_version))),
-                            )
-                            .select(StoredHistoryObject::as_select())
+                        let mut query = v::objects_version
+                            .select(StoredObjectVersion::as_select())
                             .into_boxed();
 
                         for (id, version) in id_versions.iter().cloned() {
+                            // TODO: consider using something other than `or_filter` to avoid returning
+                            // all results when `id_versions` is empty. It is mitigated today by the
+                            // early return above.
                             query = query
                                 .or_filter(v::object_id.eq(id).and(v::object_version.eq(version)));
                         }
@@ -1258,38 +1237,45 @@ impl Loader<HistoricalKey> for Db {
                 }
                 .scope_boxed()
             })
-            .await
-            .map_err(|e| Error::Internal(format!("Failed to fetch objects: {e}")))?;
-
-        let mut id_version_to_stored = BTreeMap::new();
-        for stored in objects {
-            let key = (addr(&stored.object_id)?, stored.object_version as u64);
-            id_version_to_stored.insert(key, stored);
-        }
-
-        let mut result = HashMap::new();
-        for key in keys {
-            let Some(stored) = id_version_to_stored.get(&(key.id, key.version)) else {
-                continue;
-            };
-
-            // Filter by key's checkpoint viewed at here. Doing this in memory because it should be
-            // quite rare that this query actually filters something, but encoding it in SQL is
-            // complicated.
-            if key.checkpoint_viewed_at < stored.checkpoint_sequence_number as u64 {
-                continue;
-            }
-
-            let object = Object::try_from_stored_history_object(
-                stored.clone(),
-                key.checkpoint_viewed_at,
-                // This conversion will use the object's own version as the `Object::root_version`.
-                None,
-            )?;
-            result.insert(*key, object);
-        }
-
-        Ok(result)
+            .await?
+            .into_iter()
+            .map(|v| ((v.object_id, v.object_version), v.cp_sequence_number))
+            .collect();
+        let filtered_keys: Vec<_> = keys
+            .iter()
+            .filter(|key| {
+                object_versions
+                    .get(&(key.id.into_vec(), key.version as i64))
+                    // Filter by key's checkpoint viewed at here. Doing this in memory because it should be
+                    // quite rare that this query actually filters something, but encoding it in SQL is
+                    // complicated.
+                    .is_some_and(|&seq| key.checkpoint_viewed_at >= seq as u64)
+            })
+            .collect();
+        let point_lookup_keys: Vec<_> = filtered_keys
+            .iter()
+            .map(|key| PointLookupKey {
+                id: key.id,
+                version: key.version,
+            })
+            .collect();
+        let objects = self.load(&point_lookup_keys).await?;
+        let results = filtered_keys
+            .into_iter()
+            .zip(point_lookup_keys)
+            .filter_map(|(hist_key, lookup_key)| {
+                let object = objects.get(&lookup_key)?;
+                let hist_obj = Object::new_serialized(
+                    lookup_key.id,
+                    lookup_key.version,
+                    object.clone(),
+                    hist_key.checkpoint_viewed_at,
+                    lookup_key.version,
+                );
+                hist_obj.map(|obj| (*hist_key, obj))
+            })
+            .collect();
+        Ok(results)
     }
 }
 
@@ -1329,19 +1315,12 @@ impl Loader<ParentVersionKey> for Db {
             .map(|(group_key, ids)| {
                 self.execute(move |conn| {
                     async move {
-                        let stored: Vec<StoredHistoryObject> = conn
+                        let stored: Vec<StoredObjectVersion> = conn
                             .results(move || {
-                                use objects_history::dsl as h;
                                 use objects_version::dsl as v;
 
-                                h::objects_history
-                                    .inner_join(
-                                        v::objects_version.on(v::cp_sequence_number
-                                            .eq(h::checkpoint_sequence_number)
-                                            .and(v::object_id.eq(h::object_id))
-                                            .and(v::object_version.eq(h::object_version))),
-                                    )
-                                    .select(StoredHistoryObject::as_select())
+                                v::objects_version
+                                    .select(StoredObjectVersion::as_select())
                                     .filter(v::object_id.eq_any(ids.iter().cloned()))
                                     .filter(v::object_version.le(group_key.parent_version as i64))
                                     .distinct_on(v::object_id)
@@ -1362,37 +1341,50 @@ impl Loader<ParentVersionKey> for Db {
                 })
             });
 
-        // Wait for the reads to all finish, and gather them into the result map.
         let groups = futures::future::join_all(futures).await;
-
-        let mut results = HashMap::new();
+        let mut group_map = HashMap::new();
         for group in groups {
             for (group_key, stored) in
                 group.map_err(|e| Error::Internal(format!("Failed to fetch objects: {e}")))?
             {
                 // This particular object is invalid -- it didn't exist at the checkpoint we are
                 // viewing at.
-                if group_key.checkpoint_viewed_at < stored.checkpoint_sequence_number as u64 {
+                if group_key.checkpoint_viewed_at < stored.cp_sequence_number as u64 {
                     continue;
                 }
-
-                let object = Object::try_from_stored_history_object(
-                    stored,
-                    group_key.checkpoint_viewed_at,
-                    // If `LatestAtKey::parent_version` is set, it must have been correctly
-                    // propagated from the `Object::root_version` of some object.
-                    Some(group_key.parent_version),
-                )?;
-
                 let key = ParentVersionKey {
-                    id: object.address,
+                    id: addr(&stored.object_id)?,
                     checkpoint_viewed_at: group_key.checkpoint_viewed_at,
                     parent_version: group_key.parent_version,
                 };
-
-                results.insert(key, object);
+                group_map.insert(key, stored.object_version);
             }
         }
+        let point_lookup_keys = group_map
+            .iter()
+            .map(|(parent_key, version)| PointLookupKey {
+                id: parent_key.id,
+                version: *version as u64,
+            })
+            .collect::<Vec<_>>();
+        let objects = self.load(&point_lookup_keys).await?;
+        let results = group_map
+            .into_keys()
+            .zip(point_lookup_keys)
+            .filter_map(|(parent_key, lookup_key)| {
+                let object = objects.get(&lookup_key)?;
+                let hist_obj = Object::new_serialized(
+                    parent_key.id,
+                    lookup_key.version,
+                    object.clone(),
+                    parent_key.checkpoint_viewed_at,
+                    // If `ParentVersionKey::parent_version` is set, it must have been correctly
+                    // propagated from the `Object::root_version` of some object.
+                    parent_key.parent_version,
+                );
+                hist_obj.map(|obj| (parent_key, obj))
+            })
+            .collect();
 
         Ok(results)
     }
@@ -1478,12 +1470,80 @@ impl Loader<LatestAtKey> for Db {
     }
 }
 
+#[async_trait::async_trait]
+impl Loader<PointLookupKey> for Db {
+    type Value = Option<Vec<u8>>;
+    type Error = Error;
+
+    async fn load(
+        &self,
+        keys: &[PointLookupKey],
+    ) -> Result<HashMap<PointLookupKey, Option<Vec<u8>>>, Error> {
+        use full_objects_history::dsl as f;
+
+        if keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let id_versions: BTreeSet<_> = keys
+            .iter()
+            .map(|key| (key.id.into_vec(), key.version as i64))
+            .collect();
+        let objects = self
+            .execute(move |conn| {
+                async {
+                    conn.results(move || {
+                        let mut query = f::full_objects_history
+                            .select(StoredFullHistoryObject::as_select())
+                            .into_boxed();
+
+                        for (id, version) in id_versions.iter() {
+                            // TODO: consider using something other than `or_filter` to avoid returning
+                            // all results when `id_versions` is empty. It is mitigated today by the
+                            // early return above.
+                            query = query.or_filter(
+                                f::object_id
+                                    .eq(id.clone())
+                                    .and(f::object_version.eq(*version)),
+                            );
+                        }
+
+                        query
+                    })
+                    .await
+                }
+                .scope_boxed()
+            })
+            .await?;
+        let objects_map: HashMap<_, _> = objects
+            .into_iter()
+            .map(|o| {
+                (
+                    PointLookupKey {
+                        id: addr(&o.object_id).unwrap(),
+                        version: o.object_version as u64,
+                    },
+                    o.serialized_object,
+                )
+            })
+            .collect();
+
+        let result = keys
+            .iter()
+            .filter_map(|key| {
+                let serialized = objects_map.get(key)?;
+                Some((*key, serialized.clone()))
+            })
+            .collect();
+        Ok(result)
+    }
+}
+
 impl From<&ObjectKind> for ObjectStatus {
     fn from(kind: &ObjectKind) -> Self {
         match kind {
             ObjectKind::NotIndexed(_) => ObjectStatus::NotIndexed,
-            ObjectKind::Indexed(_, _) => ObjectStatus::Indexed,
-            ObjectKind::WrappedOrDeleted(_) => ObjectStatus::WrappedOrDeleted,
+            ObjectKind::Indexed(_, _) | ObjectKind::Serialized(_) => ObjectStatus::Indexed,
         }
     }
 }
@@ -1530,66 +1590,22 @@ pub(crate) async fn deserialize_move_struct(
 }
 
 /// Constructs a raw query to fetch objects from the database. Objects are filtered out if they
-/// satisfy the criteria but have a later version in the same checkpoint. If object keys are
-/// provided, or no filters are specified at all, then this final condition is not applied.
+/// satisfy the criteria but have a later version in the same checkpoint. If no filters are
+/// specified at all, then this final condition is not applied.
 fn objects_query(filter: &ObjectFilter, range: AvailableRange, page: &Page<Cursor>) -> RawQuery
 where
 {
-    if let (Some(_), Some(_)) = (&filter.object_ids, &filter.object_keys) {
-        // If both object IDs and object keys are specified, then we need to query in
-        // both historical and consistent views, and then union the results.
-        let ids_only_filter = ObjectFilter {
-            object_keys: None,
-            ..filter.clone()
-        };
-        let (id_query, id_bindings) = build_objects_query(
-            View::Consistent,
-            range,
-            page,
-            move |query| ids_only_filter.apply(query),
-            move |newer| newer,
-        )
-        .finish();
-
-        let keys_only_filter = ObjectFilter {
-            object_ids: None,
-            ..filter.clone()
-        };
-        let (key_query, key_bindings) = build_objects_query(
-            View::Historical,
-            range,
-            page,
-            move |query| keys_only_filter.apply(query),
-            move |newer| newer,
-        )
-        .finish();
-
-        RawQuery::new(
-            format!(
-                "SELECT * FROM (({id_query}) UNION ALL ({key_query})) AS candidates",
-                id_query = id_query,
-                key_query = key_query,
-            ),
-            id_bindings.into_iter().chain(key_bindings).collect(),
-        )
-        .order_by("object_id")
-        .limit(page.limit() as i64)
-    } else {
-        // Only one of object IDs or object keys is specified, or neither are specified.
-        let view = if filter.object_keys.is_some() || !filter.has_filters() {
+    build_objects_query(
+        if !filter.has_filters() {
             View::Historical
         } else {
             View::Consistent
-        };
-
-        build_objects_query(
-            view,
-            range,
-            page,
-            move |query| filter.apply(query),
-            move |newer| newer,
-        )
-    }
+        },
+        range,
+        page,
+        move |query| filter.apply(query),
+        move |newer| newer,
+    )
 }
 
 #[cfg(test)]
@@ -1614,52 +1630,31 @@ mod tests {
     }
 
     #[test]
-    fn test_key_filter_intersection() {
+    fn test_object_filter_intersection() {
         let i1 = SuiAddress::from_str("0x1").unwrap();
         let i2 = SuiAddress::from_str("0x2").unwrap();
         let i3 = SuiAddress::from_str("0x3").unwrap();
-        let i4 = SuiAddress::from_str("0x4").unwrap();
 
+        // A standard object filter
         let f0 = ObjectFilter {
             object_ids: Some(vec![i1, i3]),
-            object_keys: Some(vec![
-                ObjectKey {
-                    object_id: i2,
-                    version: 1.into(),
-                },
-                ObjectKey {
-                    object_id: i4,
-                    version: 2.into(),
-                },
-            ]),
             ..Default::default()
         };
 
+        // Overlaps with f0 on id i1
         let f1 = ObjectFilter {
             object_ids: Some(vec![i1, i2]),
-            object_keys: Some(vec![ObjectKey {
-                object_id: i4,
-                version: 2.into(),
-            }]),
             ..Default::default()
         };
 
+        // An empty filter
         let f2 = ObjectFilter {
-            object_ids: Some(vec![i1, i3]),
             ..Default::default()
         };
 
+        // Overlaps with f0 on id i3, and does not overlap with f1
         let f3 = ObjectFilter {
-            object_keys: Some(vec![
-                ObjectKey {
-                    object_id: i2,
-                    version: 2.into(),
-                },
-                ObjectKey {
-                    object_id: i4,
-                    version: 2.into(),
-                },
-            ]),
+            object_ids: Some(vec![i3]),
             ..Default::default()
         };
 
@@ -1667,49 +1662,47 @@ mod tests {
             f0.clone().intersect(f1.clone()),
             Some(ObjectFilter {
                 object_ids: Some(vec![i1]),
-                object_keys: Some(vec![
-                    ObjectKey {
-                        object_id: i2,
-                        version: 1.into(),
-                    },
-                    ObjectKey {
-                        object_id: i4,
-                        version: 2.into(),
-                    },
-                ]),
                 ..Default::default()
             })
         );
 
         assert_eq!(
-            f1.clone().intersect(f2.clone()),
-            Some(ObjectFilter {
-                object_ids: Some(vec![i1]),
-                ..Default::default()
-            })
+            f2.clone().intersect(f2.clone()),
+            Some(ObjectFilter::default())
         );
 
-        assert_eq!(
-            f1.clone().intersect(f3.clone()),
-            Some(ObjectFilter {
-                object_keys: Some(vec![
-                    ObjectKey {
-                        object_id: i2,
-                        version: 2.into(),
-                    },
-                    ObjectKey {
-                        object_id: i4,
-                        version: 2.into(),
-                    },
-                ]),
-                ..Default::default()
-            })
-        );
+        assert_eq!(f1.clone().intersect(f2.clone()), Some(f1.clone()));
+        assert_eq!(f1.clone().intersect(f3.clone()), None);
 
-        // i2 got a conflicting version assignment
-        assert_eq!(f0.clone().intersect(f3.clone()), None);
+        // Overlaps with f1 on i2, but does not overlap with f0 or f3. Note that this also has an
+        // owner filter
+        let f4 = ObjectFilter {
+            owner: Some(i1),
+            object_ids: Some(vec![i2]),
+            type_: None,
+        };
 
-        // No overlap between these two.
-        assert_eq!(f2.clone().intersect(f3.clone()), None);
+        // Overlaps with f0 on id i1
+        let f5 = ObjectFilter {
+            owner: None,
+            object_ids: Some(vec![i1]),
+            type_: Some(TypeFilter::ByModule(
+                crate::types::type_filter::ModuleFilter::ByPackage(i3),
+            )),
+        };
+
+        // Does not overlap with f5 because module filter is different.
+        let f6 = ObjectFilter {
+            owner: None,
+            object_ids: Some(vec![i1]),
+            type_: Some(TypeFilter::ByModule(
+                crate::types::type_filter::ModuleFilter::ByPackage(i1),
+            )),
+        };
+
+        assert_eq!(f0.clone().intersect(f4.clone()), None);
+        assert_eq!(f1.clone().intersect(f4.clone()), Some(f4.clone()));
+        assert_eq!(f0.clone().intersect(f5.clone()), Some(f5.clone()));
+        assert_eq!(f5.clone().intersect(f6.clone()), None);
     }
 }

@@ -17,8 +17,8 @@ use move_bytecode_source_map::utils::source_map_from_file;
 use move_command_line_common::{
     env::MOVE_HOME,
     files::{
-        extension_equals, find_filenames, MOVE_COMPILED_EXTENSION, MOVE_EXTENSION,
-        SOURCE_MAP_EXTENSION,
+        extension_equals, find_filenames, DEBUG_INFO_EXTENSION, MOVE_COMPILED_EXTENSION,
+        MOVE_EXTENSION,
     },
 };
 use move_compiler::{
@@ -40,7 +40,7 @@ use tracing::{debug, info};
 
 pub(crate) const CURRENT_COMPILER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const LEGACY_COMPILER_VERSION: &str = CURRENT_COMPILER_VERSION; // TODO: update this when Move 2024 is released
-const PRE_TOOLCHAIN_MOVE_LOCK_VERSION: u64 = 0; // Used to detect lockfiles pre-toolchain versioning support
+const PRE_TOOLCHAIN_MOVE_LOCK_VERSION: u16 = 0; // Used to detect lockfiles pre-toolchain versioning support
 const CANONICAL_UNIX_BINARY_NAME: &str = "sui";
 const CANONICAL_WIN_BINARY_NAME: &str = "sui.exe";
 
@@ -249,9 +249,9 @@ fn download_and_compile(
         let mut dest_binary = dest_version.clone();
         dest_binary.extend(["target", "release"]);
         if platform == "windows-x86_64" {
-            dest_binary.push(&format!("sui-{platform}.exe"));
+            dest_binary.push(format!("sui-{platform}.exe"));
         } else {
-            dest_binary.push(&format!("sui-{platform}"));
+            dest_binary.push(format!("sui-{platform}"));
         }
         let dest_binary_os = OsStr::new(dest_binary.as_path());
         set_executable_permission(dest_binary_os)?;
@@ -350,9 +350,9 @@ fn decode_bytecode_file(
     let bytecode_bytes = std::fs::read(bytecode_path)?;
     let source_map = source_map_from_file(
         &root_path
-            .join(CompiledPackageLayout::SourceMaps.path())
+            .join(CompiledPackageLayout::DebugInfo.path())
             .join(&path_to_file)
-            .with_extension(SOURCE_MAP_EXTENSION),
+            .with_extension(DEBUG_INFO_EXTENSION),
     )?;
     let source_path = &root_path
         .join(CompiledPackageLayout::Sources.path())

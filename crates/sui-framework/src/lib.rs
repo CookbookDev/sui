@@ -1,14 +1,14 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use move_binary_format::binary_config::BinaryConfig;
-use move_binary_format::compatibility::Compatibility;
-use move_binary_format::file_format::{Ability, AbilitySet};
-use move_binary_format::CompiledModule;
+use move_binary_format::normalized;
+use move_binary_format::{
+    binary_config::BinaryConfig, compatibility::Compatibility, CompiledModule,
+};
 use move_core_types::gas_algebra::InternalGas;
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::fmt::Formatter;
+use std::sync::LazyLock;
 use sui_types::base_types::ObjectRef;
 use sui_types::storage::ObjectStore;
 use sui_types::{
@@ -21,13 +21,39 @@ use sui_types::{
 use sui_types::{BRIDGE_PACKAGE_ID, DEEPBOOK_PACKAGE_ID};
 use tracing::error;
 
-/// Represents a system package in the framework, that's built from the source code inside
-/// sui-framework.
+/// Encapsulates a system package in the framework
+pub struct SystemPackageMetadata {
+    /// The name of the package (e.g. "MoveStdLib")
+    pub name: String,
+    /// The path within the repo to the source (e.g. "crates/sui-framework/packages/move-stdlib")
+    pub path: String,
+    /// The compiled bytecode and object ID of the package
+    pub compiled: SystemPackage,
+}
+
+/// Encapsulates the chain-relevant data about a framework package (such as the id or compiled
+/// bytecode)
 #[derive(Clone, Serialize, PartialEq, Eq, Deserialize)]
 pub struct SystemPackage {
     pub id: ObjectID,
     pub bytes: Vec<Vec<u8>>,
     pub dependencies: Vec<ObjectID>,
+}
+
+impl SystemPackageMetadata {
+    pub fn new(
+        name: impl ToString,
+        path: impl ToString,
+        id: ObjectID,
+        raw_bytes: &'static [u8],
+        dependencies: &[ObjectID],
+    ) -> Self {
+        SystemPackageMetadata {
+            name: name.to_string(),
+            path: path.to_string(),
+            compiled: SystemPackage::new(id, raw_bytes, dependencies),
+        }
+    }
 }
 
 impl SystemPackage {
@@ -38,18 +64,6 @@ impl SystemPackage {
             bytes,
             dependencies: dependencies.to_vec(),
         }
-    }
-
-    pub fn id(&self) -> &ObjectID {
-        &self.id
-    }
-
-    pub fn bytes(&self) -> &[Vec<u8>] {
-        &self.bytes
-    }
-
-    pub fn dependencies(&self) -> &[ObjectID] {
-        &self.dependencies
     }
 
     pub fn modules(&self) -> Vec<CompiledModule> {
@@ -86,46 +100,52 @@ impl std::fmt::Debug for SystemPackage {
     }
 }
 
-macro_rules! define_system_packages {
-    ([$(($id:expr, $path:expr, $deps:expr)),* $(,)?]) => {{
-        static PACKAGES: Lazy<Vec<SystemPackage>> = Lazy::new(|| {
+macro_rules! define_system_package_metadata {
+    ([$(($id:expr, $name: expr, $path:expr, $deps:expr)),* $(,)?]) => {{
+        static PACKAGES: LazyLock<Vec<SystemPackageMetadata>> = LazyLock::new(|| {
             vec![
-                $(SystemPackage::new(
+                $(SystemPackageMetadata::new(
+                    $name,
+                    concat!("crates/sui-framework/packages/", $path),
                     $id,
                     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/packages_compiled", "/", $path)),
                     &$deps,
                 )),*
             ]
         });
-        Lazy::force(&PACKAGES)
+        &PACKAGES
     }}
 }
 
 pub struct BuiltInFramework;
 impl BuiltInFramework {
-    pub fn iter_system_packages() -> impl Iterator<Item = &'static SystemPackage> {
+    pub fn iter_system_package_metadata() -> impl Iterator<Item = &'static SystemPackageMetadata> {
         // All system packages in the current build should be registered here, and this is the only
         // place we need to worry about if any of them changes.
         // TODO: Is it possible to derive dependencies from the bytecode instead of manually specifying them?
-        define_system_packages!([
-            (MOVE_STDLIB_PACKAGE_ID, "move-stdlib", []),
+        define_system_package_metadata!([
+            (MOVE_STDLIB_PACKAGE_ID, "MoveStdlib", "move-stdlib", []),
             (
                 SUI_FRAMEWORK_PACKAGE_ID,
+                "Sui",
                 "sui-framework",
                 [MOVE_STDLIB_PACKAGE_ID]
             ),
             (
                 SUI_SYSTEM_PACKAGE_ID,
+                "SuiSystem",
                 "sui-system",
                 [MOVE_STDLIB_PACKAGE_ID, SUI_FRAMEWORK_PACKAGE_ID]
             ),
             (
                 DEEPBOOK_PACKAGE_ID,
+                "DeepBook",
                 "deepbook",
                 [MOVE_STDLIB_PACKAGE_ID, SUI_FRAMEWORK_PACKAGE_ID]
             ),
             (
                 BRIDGE_PACKAGE_ID,
+                "Bridge",
                 "bridge",
                 [
                     MOVE_STDLIB_PACKAGE_ID,
@@ -143,6 +163,10 @@ impl BuiltInFramework {
 
     pub fn get_package_by_id(id: &ObjectID) -> &'static SystemPackage {
         Self::iter_system_packages().find(|s| &s.id == id).unwrap()
+    }
+
+    pub fn iter_system_packages() -> impl Iterator<Item = &'static SystemPackage> {
+        BuiltInFramework::iter_system_package_metadata().map(|m| &m.compiled)
     }
 
     pub fn genesis_move_packages() -> impl Iterator<Item = MovePackage> {
@@ -179,9 +203,9 @@ pub async fn compare_system_package<S: ObjectStore>(
     binary_config: &BinaryConfig,
 ) -> Option<ObjectRef> {
     let cur_object = match object_store.get_object(id) {
-        Ok(Some(cur_object)) => cur_object,
+        Some(cur_object) => cur_object,
 
-        Ok(None) => {
+        None => {
             // creating a new framework package--nothing to check
             return Some(
                 Object::new_system_package(
@@ -196,11 +220,6 @@ pub async fn compare_system_package<S: ObjectStore>(
                 )
                 .compute_object_reference(),
             );
-        }
-
-        Err(e) => {
-            error!("Error loading framework object at {id}: {e:?}");
-            return None;
         }
     };
 
@@ -223,37 +242,24 @@ pub async fn compare_system_package<S: ObjectStore>(
         return Some(cur_ref);
     }
 
-    let compatibility = Compatibility {
-        check_datatype_and_pub_function_linking: true,
-        check_datatype_layout: true,
-        check_friend_linking: false,
-        // Checking `entry` linkage is required because system packages are updated in-place, and a
-        // transaction that was rolled back to make way for reconfiguration should still be runnable
-        // after a reconfiguration that upgraded the framework.
-        //
-        // A transaction that calls a system function that was previously `entry` and is now private
-        // will fail because its entrypoint became no longer callable. A transaction that calls a
-        // system function that was previously `public entry` and is now just `public` could also
-        // fail if one of its mutable inputs was being used in another private `entry` function.
-        check_private_entry_linking: true,
-        disallowed_new_abilities: AbilitySet::singleton(Ability::Key),
-        disallow_change_datatype_type_params: true,
-        disallow_new_variants: true,
-    };
+    let compatibility = Compatibility::framework_upgrade_check();
 
     let new_pkg = new_object
         .data
         .try_as_package_mut()
         .expect("Created as package");
 
-    let cur_normalized = match cur_pkg.normalize(binary_config) {
+    let pool = &mut normalized::RcPool::new();
+    let cur_normalized = match cur_pkg.normalize(pool, binary_config, /* include code */ false) {
         Ok(v) => v,
         Err(e) => {
             error!("Could not normalize existing package: {e:?}");
             return None;
         }
     };
-    let mut new_normalized = new_pkg.normalize(binary_config).ok()?;
+    let mut new_normalized = new_pkg
+        .normalize(pool, binary_config, /* include code */ false)
+        .ok()?;
 
     for (name, cur_module) in cur_normalized {
         let new_module = new_normalized.remove(&name)?;

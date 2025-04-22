@@ -1,12 +1,11 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::base_types::{AuthorityName, ObjectRef, TransactionDigest};
+use crate::base_types::{AuthorityName, ConsensusObjectSequenceKey, ObjectRef, TransactionDigest};
 use crate::base_types::{ConciseableName, ObjectID, SequenceNumber};
-use crate::digests::ConsensusCommitDigest;
-use crate::messages_checkpoint::{
-    CheckpointSequenceNumber, CheckpointSignatureMessage, CheckpointTimestamp,
-};
+use crate::digests::{AdditionalConsensusStateDigest, ConsensusCommitDigest};
+use crate::execution::ExecutionTimeObservationKey;
+use crate::messages_checkpoint::{CheckpointSequenceNumber, CheckpointSignatureMessage};
 use crate::supported_protocol_versions::{
     Chain, SupportedProtocolVersions, SupportedProtocolVersionsWithHashes,
 };
@@ -14,7 +13,7 @@ use crate::transaction::{CertifiedTransaction, Transaction};
 use byteorder::{BigEndian, ReadBytesExt};
 use fastcrypto::error::FastCryptoResult;
 use fastcrypto::groups::bls12381;
-use fastcrypto_tbls::{dkg, dkg_v1};
+use fastcrypto_tbls::dkg_v1;
 use fastcrypto_zkp::bn254::zk_login::{JwkId, JWK};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -22,7 +21,20 @@ use std::collections::hash_map::DefaultHasher;
 use std::fmt::{Debug, Formatter};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// The index of an authority in the consensus committee.
+/// The value should be the same in Sui committee.
+pub type AuthorityIndex = u32;
+
+/// Consensus round number in u64 instead of u32 for compatibility with Narwhal.
+pub type Round = u64;
+
+/// The index of a transaction in a consensus block.
+pub type TransactionIndex = u16;
+
+/// Non-decreasing timestamp produced by consensus in ms.
+pub type TimestampMs = u64;
 
 /// Only commit_timestamp_ms is passed to the move call currently.
 /// However we include epoch and round to make sure each ConsensusCommitPrologue has a unique tx digest.
@@ -30,10 +42,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct ConsensusCommitPrologue {
     /// Epoch of the commit prologue transaction
     pub epoch: u64,
-    /// Consensus round of the commit
+    /// Consensus round of the commit. Using u64 for compatibility.
     pub round: u64,
-    /// Unix timestamp from consensus
-    pub commit_timestamp_ms: CheckpointTimestamp,
+    /// Unix timestamp from consensus commit.
+    pub commit_timestamp_ms: TimestampMs,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
@@ -42,8 +54,8 @@ pub struct ConsensusCommitPrologueV2 {
     pub epoch: u64,
     /// Consensus round of the commit
     pub round: u64,
-    /// Unix timestamp from consensus
-    pub commit_timestamp_ms: CheckpointTimestamp,
+    /// Unix timestamp from consensus commit.
+    pub commit_timestamp_ms: TimestampMs,
     /// Digest of consensus output
     pub consensus_commit_digest: ConsensusCommitDigest,
 }
@@ -53,6 +65,18 @@ pub struct ConsensusCommitPrologueV2 {
 pub enum ConsensusDeterminedVersionAssignments {
     // Cancelled transaction version assignment.
     CancelledTransactions(Vec<(TransactionDigest, Vec<(ObjectID, SequenceNumber)>)>),
+    CancelledTransactionsV2(
+        Vec<(
+            TransactionDigest,
+            Vec<(ConsensusObjectSequenceKey, SequenceNumber)>,
+        )>,
+    ),
+}
+
+impl ConsensusDeterminedVersionAssignments {
+    pub fn empty_for_testing() -> Self {
+        Self::CancelledTransactions(Vec::new())
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
@@ -64,12 +88,32 @@ pub struct ConsensusCommitPrologueV3 {
     /// The sub DAG index of the consensus commit. This field will be populated if there
     /// are multiple consensus commits per round.
     pub sub_dag_index: Option<u64>,
-    /// Unix timestamp from consensus
-    pub commit_timestamp_ms: CheckpointTimestamp,
+    /// Unix timestamp from consensus commit.
+    pub commit_timestamp_ms: TimestampMs,
     /// Digest of consensus output
     pub consensus_commit_digest: ConsensusCommitDigest,
     /// Stores consensus handler determined shared object version assignments.
     pub consensus_determined_version_assignments: ConsensusDeterminedVersionAssignments,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
+pub struct ConsensusCommitPrologueV4 {
+    /// Epoch of the commit prologue transaction
+    pub epoch: u64,
+    /// Consensus round of the commit
+    pub round: u64,
+    /// The sub DAG index of the consensus commit. This field will be populated if there
+    /// are multiple consensus commits per round.
+    pub sub_dag_index: Option<u64>,
+    /// Unix timestamp from consensus commit.
+    pub commit_timestamp_ms: TimestampMs,
+    /// Digest of consensus output
+    pub consensus_commit_digest: ConsensusCommitDigest,
+    /// Stores consensus handler determined shared object version assignments.
+    pub consensus_determined_version_assignments: ConsensusDeterminedVersionAssignments,
+    /// Digest of any additional state computed by the consensus handler.
+    /// Used to detect forking bugs as early as possible.
+    pub additional_state_digest: AdditionalConsensusStateDigest,
 }
 
 // In practice, JWKs are about 500 bytes of json each, plus a bit more for the ID.
@@ -100,7 +144,7 @@ pub enum ConsensusTransactionKey {
     NewJWKFetched(Box<(AuthorityName, JwkId, JWK)>),
     RandomnessDkgMessage(AuthorityName),
     RandomnessDkgConfirmation(AuthorityName),
-    UserTransaction(TransactionDigest),
+    ExecutionTimeObservation(AuthorityName, u64 /* generation */),
 }
 
 impl Debug for ConsensusTransactionKey {
@@ -133,7 +177,13 @@ impl Debug for ConsensusTransactionKey {
             Self::RandomnessDkgConfirmation(name) => {
                 write!(f, "RandomnessDkgConfirmation({:?})", name.concise())
             }
-            Self::UserTransaction(digest) => write!(f, "UserTransaction({:?})", digest),
+            Self::ExecutionTimeObservation(name, generation) => {
+                write!(
+                    f,
+                    "ExecutionTimeObservation({:?}, {generation:?})",
+                    name.concise()
+                )
+            }
         }
     }
 }
@@ -255,6 +305,39 @@ impl AuthorityCapabilitiesV2 {
     }
 }
 
+/// Used to share estimates of transaction execution times with other validators for
+/// congestion control.
+#[derive(Debug, Default, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
+pub struct ExecutionTimeObservation {
+    /// Originating authority - must match transaction source authority from consensus.
+    pub authority: AuthorityName,
+    /// Generation number set by sending authority. Used to determine which of multiple
+    /// ExecutionTimeObservation messages from the same authority is the most recent.
+    pub generation: u64,
+
+    /// Estimated execution durations by key.
+    pub estimates: Vec<(ExecutionTimeObservationKey, Duration)>,
+}
+
+impl ExecutionTimeObservation {
+    pub fn new(
+        authority: AuthorityName,
+        estimates: Vec<(ExecutionTimeObservationKey, Duration)>,
+    ) -> Self {
+        let generation = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Sui did not exist prior to 1970")
+            .as_micros()
+            .try_into()
+            .expect("This build of sui is not supported in the year 500,000");
+        Self {
+            authority,
+            generation,
+            estimates,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum ConsensusTransactionKind {
     CertifiedTransaction(Box<CertifiedTransaction>),
@@ -277,6 +360,8 @@ pub enum ConsensusTransactionKind {
     CapabilityNotificationV2(AuthorityCapabilitiesV2),
 
     UserTransaction(Box<Transaction>),
+
+    ExecutionTimeObservation(ExecutionTimeObservation),
 }
 
 impl ConsensusTransactionKind {
@@ -299,7 +384,7 @@ pub enum VersionedDkgMessage {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VersionedDkgConfirmation {
     V0(), // deprecated
-    V1(dkg::Confirmation<bls12381::G2Element>),
+    V1(dkg_v1::Confirmation<bls12381::G2Element>),
 }
 
 impl Debug for VersionedDkgMessage {
@@ -327,10 +412,10 @@ impl VersionedDkgMessage {
 
     pub fn create(
         dkg_version: u64,
-        party: Arc<dkg::Party<bls12381::G2Element, bls12381::G2Element>>,
+        party: Arc<dkg_v1::Party<bls12381::G2Element, bls12381::G2Element>>,
     ) -> FastCryptoResult<VersionedDkgMessage> {
         assert_eq!(dkg_version, 1, "BUG: invalid DKG version");
-        let msg = party.create_message_v1(&mut rand::thread_rng())?;
+        let msg = party.create_message(&mut rand::thread_rng())?;
         Ok(VersionedDkgMessage::V1(msg))
     }
 
@@ -365,7 +450,7 @@ impl VersionedDkgConfirmation {
         }
     }
 
-    pub fn unwrap_v1(&self) -> &dkg::Confirmation<bls12381::G2Element> {
+    pub fn unwrap_v1(&self) -> &dkg_v1::Confirmation<bls12381::G2Element> {
         match self {
             VersionedDkgConfirmation::V1(msg) => msg,
             _ => panic!("BUG: expected V1 confirmation"),
@@ -390,6 +475,18 @@ impl ConsensusTransaction {
         Self {
             tracking_id,
             kind: ConsensusTransactionKind::CertifiedTransaction(Box::new(certificate)),
+        }
+    }
+
+    pub fn new_user_transaction_message(authority: &AuthorityName, tx: Transaction) -> Self {
+        let mut hasher = DefaultHasher::new();
+        let tx_digest = tx.digest();
+        tx_digest.hash(&mut hasher);
+        authority.hash(&mut hasher);
+        let tracking_id = hasher.finish().to_le_bytes();
+        Self {
+            tracking_id,
+            kind: ConsensusTransactionKind::UserTransaction(Box::new(tx)),
         }
     }
 
@@ -489,6 +586,16 @@ impl ConsensusTransaction {
         }
     }
 
+    pub fn new_execution_time_observation(observation: ExecutionTimeObservation) -> Self {
+        let mut hasher = DefaultHasher::new();
+        observation.hash(&mut hasher);
+        let tracking_id = hasher.finish().to_le_bytes();
+        Self {
+            tracking_id,
+            kind: ConsensusTransactionKind::ExecutionTimeObservation(observation),
+        }
+    }
+
     pub fn get_tracking_id(&self) -> u64 {
         (&self.tracking_id[..])
             .read_u64::<BigEndian>()
@@ -532,13 +639,24 @@ impl ConsensusTransaction {
                 ConsensusTransactionKey::RandomnessDkgConfirmation(*authority)
             }
             ConsensusTransactionKind::UserTransaction(tx) => {
-                ConsensusTransactionKey::UserTransaction(*tx.digest())
+                // Use the same key format as ConsensusTransactionKind::CertifiedTransaction,
+                // because existing usages of ConsensusTransactionKey should not differentiate
+                // between CertifiedTransaction and UserTransaction.
+                ConsensusTransactionKey::Certificate(*tx.digest())
+            }
+            ConsensusTransactionKind::ExecutionTimeObservation(msg) => {
+                ConsensusTransactionKey::ExecutionTimeObservation(msg.authority, msg.generation)
             }
         }
     }
 
-    pub fn is_user_certificate(&self) -> bool {
+    pub fn is_executable_transaction(&self) -> bool {
         matches!(self.kind, ConsensusTransactionKind::CertifiedTransaction(_))
+            || matches!(self.kind, ConsensusTransactionKind::UserTransaction(_))
+    }
+
+    pub fn is_user_transaction(&self) -> bool {
+        matches!(self.kind, ConsensusTransactionKind::UserTransaction(_))
     }
 
     pub fn is_end_of_publish(&self) -> bool {

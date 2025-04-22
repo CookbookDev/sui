@@ -34,7 +34,7 @@ pub fn validate_syntax_methods(
                 if !validate_index_syntax_methods(context, index_defn, index_mut_defn) {
                     // If we didn't validate they wre comptaible, we remove the mut one to avoid more
                     // typing issues later.
-                    assert!(context.env.has_errors());
+                    assert!(context.env().has_errors());
                     *index_mut = None;
                 }
             }
@@ -73,7 +73,7 @@ fn validate_index_syntax_methods(
         diag.add_note(
             "Index operations on the same type must take the name number of type arguments",
         );
-        context.env.add_diag(diag);
+        context.add_diag(diag);
         return false;
     }
 
@@ -92,7 +92,7 @@ fn validate_index_syntax_methods(
             (index_mut.loc, index_mut_msg),
         );
         diag.add_note("Index operations on the same type must take the name number of parameters");
-        context.env.add_diag(diag);
+        context.add_diag(diag);
         return false;
     }
 
@@ -121,7 +121,7 @@ fn validate_index_syntax_methods(
                 diag.add_note(
                     "Index operations on use the same abilities for their type parameters",
                 );
-                context.env.add_diag(diag);
+                context.add_diag(diag);
                 valid = false;
             }
         }
@@ -142,7 +142,7 @@ fn validate_index_syntax_methods(
                 diag.add_note(
                     "Index operations on use the same abilities for their type parameters",
                 );
-                context.env.add_diag(diag);
+                context.add_diag(diag);
                 valid = false;
             }
         }
@@ -173,7 +173,6 @@ fn validate_index_syntax_methods(
         index_fn,
         Some(mut_tparam_types),
     );
-    context.current_module = None;
 
     let index_params = index_ty.params.iter().map(|(_, t1)| t1);
     let mut_params = mut_finfo.signature.parameters.iter().map(|(_, _, ty)| ty);
@@ -185,9 +184,12 @@ fn validate_index_syntax_methods(
     // `&` param. We already ensured they were both references of the appropriate shape in naming,
     // so this is a bit redundant.
     if let Some((ndx, (subject_ref_type, subject_mut_ref_type))) = param_tys.next() {
-        if let Ok((subst_, _)) =
-            core::subtype(subst.clone(), subject_mut_ref_type, subject_ref_type)
-        {
+        if let Ok((subst_, _)) = core::subtype(
+            &mut context.tvar_counter,
+            subst.clone(),
+            subject_mut_ref_type,
+            subject_ref_type,
+        ) {
             subst = subst_;
         } else {
             let (_, _, index_type) = &index_finfo.signature.parameters[ndx];
@@ -200,7 +202,7 @@ fn validate_index_syntax_methods(
             let N::Type_::Ref(false, inner) =
                 core::ready_tvars(&subst, subject_ref_type.clone()).value
             else {
-                context.env.add_diag(ice!((
+                context.add_diag(ice!((
                     index_finfo.signature.return_type.loc,
                     "This index function got to type verification with an invalid type"
                 )));
@@ -228,7 +230,7 @@ fn validate_index_syntax_methods(
             diag.add_note(
                 "These functions must take the same subject type, differing only by mutability",
             );
-            context.env.add_diag(diag);
+            context.add_diag(diag);
             valid = false;
         }
     } else {
@@ -237,7 +239,9 @@ fn validate_index_syntax_methods(
 
     // We ensure the rest of the parameters match exactly.
     for (ndx, (ptype, mut_ptype)) in param_tys {
-        if let Ok((subst_, _)) = core::invariant(subst.clone(), ptype, mut_ptype) {
+        if let Ok((subst_, _)) =
+            core::invariant(&mut context.tvar_counter, subst.clone(), ptype, mut_ptype)
+        {
             subst = subst_;
         } else {
             let (_, _, index_type) = &index_finfo.signature.parameters[ndx];
@@ -262,7 +266,7 @@ fn validate_index_syntax_methods(
                 &mut_finfo.signature.type_parameters,
             );
             diag.add_note("Index operation non-subject parameter types must match exactly");
-            context.env.add_diag(diag);
+            context.add_diag(diag);
             valid = false;
         }
     }
@@ -271,6 +275,7 @@ fn validate_index_syntax_methods(
     // that they are appropriately-shaped references, and now we ensure they refer to the same type
     // under the reference.
     if core::subtype(
+        &mut context.tvar_counter,
         subst.clone(),
         &mut_finfo.signature.return_type,
         &index_ty.return_,
@@ -282,7 +287,7 @@ fn validate_index_syntax_methods(
         let index_msg = format!("This index function returns type {}", ty_str(index_type));
         let N::Type_::Ref(false, inner) = core::ready_tvars(&subst, index_ty.return_.clone()).value
         else {
-            context.env.add_diag(ice!((
+            context.add_diag(ice!((
                 index_finfo.signature.return_type.loc,
                 "This index function got to type verification with an invalid type"
             )));
@@ -308,7 +313,7 @@ fn validate_index_syntax_methods(
             &mut_finfo.signature.type_parameters,
         );
         diag.add_note("These functions must return the same type, differing only by mutability");
-        context.env.add_diag(diag);
+        context.add_diag(diag);
         valid = false;
     }
 

@@ -7,10 +7,9 @@ use fastcrypto::error::{FastCryptoError, FastCryptoResult};
 use fastcrypto::groups::bls12381;
 use fastcrypto::serde_helpers::ToFromByteArray;
 use fastcrypto::traits::{KeyPair, ToFromBytes};
-use fastcrypto_tbls::{dkg, dkg::Output, dkg_v1, nodes, nodes::PartyId};
+use fastcrypto_tbls::{dkg_v1, dkg_v1::Output, nodes, nodes::PartyId};
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use narwhal_types::{Round, TimestampMs};
 use parking_lot::Mutex;
 use rand::rngs::{OsRng, StdRng};
 use rand::SeedableRng;
@@ -24,15 +23,18 @@ use sui_types::base_types::AuthorityName;
 use sui_types::committee::{Committee, EpochId, StakeUnit};
 use sui_types::crypto::{AuthorityKeyPair, RandomnessRound};
 use sui_types::error::{SuiError, SuiResult};
-use sui_types::messages_consensus::VersionedDkgMessage;
-use sui_types::messages_consensus::{ConsensusTransaction, VersionedDkgConfirmation};
+use sui_types::messages_consensus::{
+    ConsensusTransaction, Round, TimestampMs, VersionedDkgConfirmation, VersionedDkgMessage,
+};
 use sui_types::sui_system_state::epoch_start_sui_system_state::EpochStartSystemStateTrait;
 use tokio::sync::OnceCell;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use typed_store::Map;
 
-use crate::authority::authority_per_epoch_store::{AuthorityPerEpochStore, ConsensusCommitOutput};
+use crate::authority::authority_per_epoch_store::{
+    consensus_quarantine::ConsensusCommitOutput, AuthorityPerEpochStore,
+};
 use crate::authority::epoch_start_configuration::EpochStartConfigTrait;
 use crate::consensus_adapter::SubmitToConsensus;
 
@@ -69,20 +71,20 @@ impl VersionedProcessedMessage {
     }
 
     pub fn process(
-        party: Arc<dkg::Party<PkG, EncG>>,
+        party: Arc<dkg_v1::Party<PkG, EncG>>,
         message: VersionedDkgMessage,
     ) -> FastCryptoResult<VersionedProcessedMessage> {
         // All inputs are verified in add_message, so we can assume they are of the correct version.
-        let processed = party.process_message_v1(message.unwrap_v1(), &mut rand::thread_rng())?;
+        let processed = party.process_message(message.unwrap_v1(), &mut rand::thread_rng())?;
         Ok(VersionedProcessedMessage::V1(processed))
     }
 
     pub fn merge(
-        party: Arc<dkg::Party<PkG, EncG>>,
+        party: Arc<dkg_v1::Party<PkG, EncG>>,
         messages: Vec<Self>,
     ) -> FastCryptoResult<(VersionedDkgConfirmation, VersionedUsedProcessedMessages)> {
         // All inputs were created by this validator, so we can assume they are of the correct version.
-        let (conf, msgs) = party.merge_v1(
+        let (conf, msgs) = party.merge(
             &messages
                 .into_iter()
                 .map(|vm| vm.unwrap_v1())
@@ -104,7 +106,7 @@ pub enum VersionedUsedProcessedMessages {
 impl VersionedUsedProcessedMessages {
     fn complete_dkg<'a, Iter: Iterator<Item = &'a VersionedDkgConfirmation>>(
         &self,
-        party: Arc<dkg::Party<PkG, EncG>>,
+        party: Arc<dkg_v1::Party<PkG, EncG>>,
         confirmations: Iter,
     ) -> FastCryptoResult<Output<PkG, EncG>> {
         // All inputs are verified in add_confirmation, so we can assume they are of the correct version.
@@ -112,7 +114,7 @@ impl VersionedUsedProcessedMessages {
         let VersionedUsedProcessedMessages::V1(msg) = self else {
             panic!("BUG: invalid VersionedUsedProcessedMessages version")
         };
-        party.complete_v1(
+        party.complete(
             msg,
             &confirmations
                 .map(|vm| vm.unwrap_v1())
@@ -151,12 +153,12 @@ pub struct RandomnessManager {
 
     // State for DKG.
     dkg_start_time: OnceCell<Instant>,
-    party: Arc<dkg::Party<PkG, EncG>>,
+    party: Arc<dkg_v1::Party<PkG, EncG>>,
     enqueued_messages: BTreeMap<PartyId, JoinHandle<Option<VersionedProcessedMessage>>>,
     processed_messages: BTreeMap<PartyId, VersionedProcessedMessage>,
     used_messages: OnceCell<VersionedUsedProcessedMessages>,
     confirmations: BTreeMap<PartyId, VersionedDkgConfirmation>,
-    dkg_output: OnceCell<Option<dkg::Output<PkG, EncG>>>,
+    dkg_output: OnceCell<Option<dkg_v1::Output<PkG, EncG>>>,
 
     // State for randomness generation.
     next_randomness_round: RandomnessRound,
@@ -256,8 +258,10 @@ impl RandomnessManager {
                 .expect("key length should match"),
         )
         .expect("should work to convert BLS key to Scalar");
-        let party = match dkg::Party::<PkG, EncG>::new(
-            fastcrypto_tbls::ecies::PrivateKey::<bls12381::G2Element>::from(randomness_private_key),
+        let party = match dkg_v1::Party::<PkG, EncG>::new(
+            fastcrypto_tbls::ecies_v1::PrivateKey::<bls12381::G2Element>::from(
+                randomness_private_key,
+            ),
             nodes,
             t,
             fastcrypto_tbls::random_oracle::RandomOracle::new(prefix_str.as_str()),
@@ -420,8 +424,7 @@ impl RandomnessManager {
         });
         if !fail_point_skip_sending {
             self.consensus_adapter
-                .submit_to_consensus(&[transaction], &epoch_store)
-                .await?;
+                .submit_to_consensus(&[transaction], &epoch_store)?;
         }
 
         epoch_store
@@ -491,8 +494,7 @@ impl RandomnessManager {
                     });
                     if !fail_point_skip_sending {
                         self.consensus_adapter
-                            .submit_to_consensus(&[transaction], &epoch_store)
-                            .await?;
+                            .submit_to_consensus(&[transaction], &epoch_store)?;
                     }
 
                     let elapsed = self.dkg_start_time.get().map(|t| t.elapsed().as_millis());
@@ -667,12 +669,11 @@ impl RandomnessManager {
         output: &mut ConsensusCommitOutput,
     ) -> SuiResult<Option<RandomnessRound>> {
         let epoch_store = self.epoch_store()?;
-        let tables = epoch_store.tables()?;
 
-        let last_round_timestamp = tables
-            .randomness_last_round_timestamp
-            .get(&SINGLETON_KEY)
-            .expect("typed_store should not fail");
+        let last_round_timestamp = epoch_store
+            .get_randomness_last_round_timestamp()
+            .expect("read should not fail");
+
         if let Some(last_round_timestamp) = last_round_timestamp {
             if commit_timestamp - last_round_timestamp
                 < epoch_store
@@ -729,7 +730,7 @@ impl RandomnessManager {
     ) -> Vec<(
         u16,
         AuthorityName,
-        fastcrypto_tbls::ecies::PublicKey<bls12381::G2Element>,
+        fastcrypto_tbls::ecies_v1::PublicKey<bls12381::G2Element>,
         StakeUnit,
     )> {
         committee
@@ -752,7 +753,7 @@ impl RandomnessManager {
                 (
                     index,
                     *name,
-                    fastcrypto_tbls::ecies::PublicKey::from(pk),
+                    fastcrypto_tbls::ecies_v1::PublicKey::from(pk),
                     *stake,
                 )
             })
@@ -802,13 +803,19 @@ pub enum DkgStatus {
 #[cfg(test)]
 mod tests {
     use crate::{
-        authority::test_authority_builder::TestAuthorityBuilder,
+        authority::{
+            authority_per_epoch_store::{ExecutionIndices, ExecutionIndicesWithStats},
+            test_authority_builder::TestAuthorityBuilder,
+        },
+        checkpoints::CheckpointStore,
         consensus_adapter::{
             ConnectionMonitorStatusForTests, ConsensusAdapter, ConsensusAdapterMetrics,
-            MockSubmitToConsensus,
+            MockConsensusClient,
         },
         epoch::randomness::*,
+        mock_consensus::with_block_status,
     };
+    use consensus_core::{BlockRef, BlockStatus};
     use std::num::NonZeroUsize;
     use sui_protocol_config::ProtocolConfig;
     use sui_protocol_config::{Chain, ProtocolVersion};
@@ -839,15 +846,15 @@ mod tests {
 
         for validator in network_config.validator_configs.iter() {
             // Send consensus messages to channel.
-            let mut mock_consensus_client = MockSubmitToConsensus::new();
+            let mut mock_consensus_client = MockConsensusClient::new();
             let tx_consensus = tx_consensus.clone();
             mock_consensus_client
-                .expect_submit_to_consensus()
+                .expect_submit()
                 .withf(move |transactions: &[ConsensusTransaction], _epoch_store| {
                     tx_consensus.try_send(transactions.to_vec()).unwrap();
                     true
                 })
-                .returning(|_, _| Ok(()));
+                .returning(|_, _| Ok(with_block_status(BlockStatus::Sequenced(BlockRef::MIN))));
 
             let state = TestAuthorityBuilder::new()
                 .with_protocol_config(protocol_config.clone())
@@ -856,6 +863,7 @@ mod tests {
                 .await;
             let consensus_adapter = Arc::new(ConsensusAdapter::new(
                 Arc::new(mock_consensus_client),
+                CheckpointStore::new_for_tests(),
                 state.name,
                 Arc::new(ConnectionMonitorStatusForTests {}),
                 100_000,
@@ -896,7 +904,14 @@ mod tests {
             }
         }
         for i in 0..randomness_managers.len() {
-            let mut output = ConsensusCommitOutput::new();
+            let mut output = ConsensusCommitOutput::new(0);
+            output.record_consensus_commit_stats(ExecutionIndicesWithStats {
+                index: ExecutionIndices {
+                    last_committed_round: 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
             for (j, dkg_message) in dkg_messages.iter().cloned().enumerate() {
                 randomness_managers[i]
                     .add_message(&epoch_stores[j].name, dkg_message)
@@ -926,7 +941,14 @@ mod tests {
             }
         }
         for i in 0..randomness_managers.len() {
-            let mut output = ConsensusCommitOutput::new();
+            let mut output = ConsensusCommitOutput::new(0);
+            output.record_consensus_commit_stats(ExecutionIndicesWithStats {
+                index: ExecutionIndices {
+                    last_committed_round: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
             for (j, dkg_confirmation) in dkg_confirmations.iter().cloned().enumerate() {
                 randomness_managers[i]
                     .add_confirmation(&mut output, &epoch_stores[j].name, dkg_confirmation)
@@ -971,15 +993,19 @@ mod tests {
 
         for validator in network_config.validator_configs.iter() {
             // Send consensus messages to channel.
-            let mut mock_consensus_client = MockSubmitToConsensus::new();
+            let mut mock_consensus_client = MockConsensusClient::new();
             let tx_consensus = tx_consensus.clone();
             mock_consensus_client
-                .expect_submit_to_consensus()
+                .expect_submit()
                 .withf(move |transactions: &[ConsensusTransaction], _epoch_store| {
                     tx_consensus.try_send(transactions.to_vec()).unwrap();
                     true
                 })
-                .returning(|_, _| Ok(()));
+                .returning(|_, _| {
+                    Ok(with_block_status(consensus_core::BlockStatus::Sequenced(
+                        BlockRef::MIN,
+                    )))
+                });
 
             let state = TestAuthorityBuilder::new()
                 .with_protocol_config(protocol_config.clone())
@@ -988,6 +1014,7 @@ mod tests {
                 .await;
             let consensus_adapter = Arc::new(ConsensusAdapter::new(
                 Arc::new(mock_consensus_client),
+                CheckpointStore::new_for_tests(),
                 state.name,
                 Arc::new(ConnectionMonitorStatusForTests {}),
                 100_000,
@@ -1028,7 +1055,14 @@ mod tests {
             }
         }
         for i in 0..randomness_managers.len() {
-            let mut output = ConsensusCommitOutput::new();
+            let mut output = ConsensusCommitOutput::new(0);
+            output.record_consensus_commit_stats(ExecutionIndicesWithStats {
+                index: ExecutionIndices {
+                    last_committed_round: 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
             for (j, dkg_message) in dkg_messages.iter().cloned().enumerate() {
                 randomness_managers[i]
                     .add_message(&epoch_stores[j].name, dkg_message)

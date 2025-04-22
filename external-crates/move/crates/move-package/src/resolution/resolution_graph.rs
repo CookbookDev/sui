@@ -8,7 +8,7 @@ use move_command_line_common::files::{
 };
 use move_compiler::command_line::DEFAULT_OUTPUT_DIR;
 use move_compiler::editions::Edition;
-use move_compiler::{diagnostics::WarningFilters, shared::PackageConfig};
+use move_compiler::{diagnostics::warning_filters::WarningFiltersBuilder, shared::PackageConfig};
 use move_core_types::account_address::AccountAddress;
 use move_symbol_pool::Symbol;
 use std::fs::File;
@@ -125,9 +125,17 @@ impl ResolvedGraph {
                 match dep {
                     PM::Dependency::External(_) => continue,
                     PM::Dependency::Internal(internal) => {
-                        if let PM::DependencyKind::Custom(_) = internal.kind {
+                        if let PM::DependencyKind::OnChain(_) = internal.kind {
                             continue;
                         }
+                        dependency_cache
+                            .download_and_update_if_remote(
+                                *dep_name,
+                                &internal.kind,
+                                progress_output,
+                            )
+                            .with_context(|| format!("Fetching '{dep_name}'"))?;
+
                         let dep_path = &resolved_pkg.package_path.join(local_path(&internal.kind));
                         let dep_manifest = parse_move_manifest_from_file(dep_path)?;
                         if dep_name != &dep_manifest.package.name {
@@ -586,7 +594,7 @@ impl Package {
                 .edition
                 .or(config.default_edition)
                 .unwrap_or(Edition::LEGACY), // TODO require edition
-            warning_filter: WarningFilters::new_for_source(),
+            warning_filter: WarningFiltersBuilder::new_for_source(),
         }
     }
 }

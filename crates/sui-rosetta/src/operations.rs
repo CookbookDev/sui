@@ -252,7 +252,9 @@ impl Operations {
         status: Option<OperationStatus>,
     ) -> Result<Vec<Operation>, Error> {
         Ok(match tx {
-            SuiTransactionBlockKind::ProgrammableTransaction(pt) => {
+            SuiTransactionBlockKind::ProgrammableTransaction(pt)
+                if status != Some(OperationStatus::Failure) =>
+            {
                 Self::parse_programmable_transaction(sender, status, pt)?
             }
             _ => vec![Operation::generic_op(status, sender, tx)],
@@ -299,7 +301,7 @@ impl Operations {
                 .map(|amount| {
                     let value: u64 = match *amount {
                         SuiArgument::Input(i) => {
-                            u64::from_str(inputs[i as usize].pure()?.to_json_value().as_str()?)
+                            u64::from_str(inputs.get(i as usize)?.pure()?.to_json_value().as_str()?)
                                 .ok()?
                         }
                         SuiArgument::GasCoin
@@ -319,7 +321,7 @@ impl Operations {
             recipient: SuiArgument,
         ) -> Option<Vec<KnownValue>> {
             let addr = match recipient {
-                SuiArgument::Input(i) => inputs[i as usize].pure()?.to_sui_address().ok()?,
+                SuiArgument::Input(i) => inputs.get(i as usize)?.pure()?.to_sui_address().ok()?,
                 SuiArgument::GasCoin | SuiArgument::Result(_) | SuiArgument::NestedResult(_, _) => {
                     return None
                 }
@@ -361,7 +363,7 @@ impl Operations {
                         // We use the position of the validator arg as a indicator of if the rosetta stake
                         // transaction is staking the whole wallet or not, if staking whole wallet,
                         // we have to omit the amount value in the final operation output.
-                        SuiArgument::Input(i) => (*i==1, inputs[*i as usize].pure().map(|v|v.to_sui_address()).transpose()),
+                        SuiArgument::Input(i) => (*i==1, inputs.get(*i as usize).and_then(|input| input.pure()).map(|v|v.to_sui_address()).transpose()),
                         _=> return Ok(None),
                     };
                     (some_amount.then_some(*amount), validator)
@@ -380,7 +382,7 @@ impl Operations {
                 [_, stake_id] => {
                     match stake_id {
                         SuiArgument::Input(i) => {
-                            let id = inputs[*i as usize].object().ok_or_else(|| anyhow!("Cannot find stake id from input args."))?;
+                            let id = inputs.get(*i as usize).and_then(|input| input.object()).ok_or_else(|| anyhow!("Cannot find stake id from input args."))?;
                             // [WORKAROUND] - this is a hack to work out if the withdraw stake ops is for a selected stake or None (all stakes).
                             // this hack is similar to the one in stake_call.
                             let some_id = i % 2 == 1;
@@ -558,14 +560,16 @@ impl Operations {
     }
 }
 
-impl TryFrom<SuiTransactionBlockData> for Operations {
-    type Error = Error;
-    fn try_from(data: SuiTransactionBlockData) -> Result<Self, Self::Error> {
+impl Operations {
+    fn try_from_data(
+        data: SuiTransactionBlockData,
+        status: Option<OperationStatus>,
+    ) -> Result<Self, anyhow::Error> {
         let sender = *data.sender();
         Ok(Self::new(Self::from_transaction(
             data.transaction().clone(),
             sender,
-            None,
+            status,
         )?))
     }
 }
@@ -588,8 +592,8 @@ impl Operations {
             - gas_summary.computation_cost as i128;
 
         let status = Some(effect.into_status().into());
-        let ops: Operations = tx.data.try_into()?;
-        let ops = ops.set_status(status).into_iter();
+        let ops = Operations::try_from_data(tx.data, status)?;
+        let ops = ops.into_iter();
 
         // We will need to subtract the operation amounts from the actual balance
         // change amount extracted from event to prevent double counting.
@@ -651,7 +655,9 @@ impl Operations {
             .ok_or_else(|| anyhow!("Response balance changes should not be empty."))?
         {
             if let Ok(currency) = cache.get_currency(&balance_change.coin_type).await {
-                balance_changes.push((balance_change.clone(), currency));
+                if !currency.symbol.is_empty() {
+                    balance_changes.push((balance_change.clone(), currency));
+                }
             }
         }
 
@@ -733,7 +739,10 @@ impl TryFrom<TransactionData> for Operations {
             }
         }
         // Rosetta don't need the call args to be parsed into readable format
-        SuiTransactionBlockData::try_from(data, &&mut NoOpsModuleResolver)?.try_into()
+        Ok(Operations::try_from_data(
+            SuiTransactionBlockData::try_from_with_module_cache(data, &&mut NoOpsModuleResolver)?,
+            None,
+        )?)
     }
 }
 

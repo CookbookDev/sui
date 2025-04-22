@@ -23,7 +23,7 @@ use move_core_types::{
     language_storage::{ModuleId, StructTag, TypeTag},
     vm_status::StatusCode,
 };
-#[cfg(feature = "gas-profiler")]
+#[cfg(feature = "tracing")]
 use move_vm_profiler::GasProfiler;
 use move_vm_runtime::{
     move_vm::MoveVM,
@@ -33,7 +33,7 @@ use move_vm_test_utils::{
     gas_schedule::{Gas, GasStatus, INITIAL_COST_SCHEDULE},
     InMemoryStorage,
 };
-#[cfg(feature = "gas-profiler")]
+#[cfg(feature = "tracing")]
 use move_vm_types::gas::GasMeter;
 use std::time::Instant;
 
@@ -160,7 +160,7 @@ fn test_instantiation_no_instantiation() {
 // Common runner for all tests.
 // Run a control test (load_pop) and an instantiation test which is then
 // compared against the control.
-// Ensure that tests complete with "out of gas" and withing a given time range.
+// Ensure that tests complete with "out of gas" and within a given time range.
 fn test_runner(
     gas_val: u64,
     test_name: &str,
@@ -185,7 +185,7 @@ fn test_runner(
     // assert_eq!(err, StatusCode::OUT_OF_GAS, "Must finish OutOfGas");
     assert!(
         check_result(time, ref_time),
-        "Instantion test taking too long {}",
+        "Instantiation test taking too long {}",
         time
     );
 }
@@ -555,7 +555,7 @@ fn run_with_module(
         .into_iter()
         .map(|tag| session.load_type(&tag))
         .collect::<VMResult<Vec<_>>>();
-    move_vm_profiler::gas_profiler_feature_enabled! {
+    move_vm_profiler::tracing_feature_enabled! {
         gas.set_profiler(GasProfiler::init(
             &session.vm_config().profiler_config,
             entry_name.to_string(),

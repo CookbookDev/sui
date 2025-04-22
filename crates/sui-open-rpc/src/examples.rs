@@ -18,6 +18,7 @@ use serde_json::json;
 
 use sui_json::SuiJsonValue;
 use sui_json_rpc::error::Error;
+use sui_json_rpc_types::BcsEvent;
 use sui_json_rpc_types::DevInspectArgs;
 use sui_json_rpc_types::{
     Balance, Checkpoint, CheckpointId, CheckpointPage, Coin, CoinPage, DelegatedStake,
@@ -754,7 +755,11 @@ impl RpcExampleProvider {
             balance_changes: None,
             timestamp_ms: None,
             transaction: Some(SuiTransactionBlock {
-                data: SuiTransactionBlockData::try_from(data1, &&mut NoOpsModuleResolver).unwrap(),
+                data: SuiTransactionBlockData::try_from_with_module_cache(
+                    data1,
+                    &&mut NoOpsModuleResolver,
+                )
+                .unwrap(),
                 tx_signatures: signatures.clone(),
             }),
             raw_transaction,
@@ -780,7 +785,7 @@ impl RpcExampleProvider {
             sender: SuiAddress::from(ObjectID::new(self.rng.gen())),
             type_: parse_sui_struct_tag("0x9::test::TestEvent").unwrap(),
             parsed_json: json!({"test": "example value"}),
-            bcs: vec![],
+            bcs: BcsEvent::new(vec![]),
             timestamp_ms: None,
         };
 
@@ -853,7 +858,6 @@ impl RpcExampleProvider {
         let limit = 3;
         let owner = SuiAddress::from(ObjectID::new(self.rng.gen()));
         let cursor = ObjectID::new(self.rng.gen());
-        let next = ObjectID::new(self.rng.gen());
         let coins = (0..3)
             .map(|_| Coin {
                 coin_type: "0x2::sui::SUI".to_string(),
@@ -867,7 +871,7 @@ impl RpcExampleProvider {
             .collect::<Vec<_>>();
         let page = CoinPage {
             data: coins,
-            next_cursor: Some(next),
+            next_cursor: Some("abcd".to_string()),
             has_next_page: true,
         };
 
@@ -955,11 +959,9 @@ impl RpcExampleProvider {
             })
             .collect::<Vec<_>>();
 
-        let next_cursor = coins.last().unwrap().coin_object_id;
-
         let page = CoinPage {
             data: coins,
-            next_cursor: Some(next_cursor),
+            next_cursor: Some("abcd".to_string()),
             has_next_page: true,
         };
 
@@ -1054,6 +1056,7 @@ impl RpcExampleProvider {
             friends: vec![],
             name: "module".to_string(),
             structs: BTreeMap::new(),
+            enums: BTreeMap::new(),
         };
 
         Examples::new(
@@ -1077,6 +1080,7 @@ impl RpcExampleProvider {
             friends: vec![],
             name: "module".to_string(),
             structs: BTreeMap::new(),
+            enums: BTreeMap::new(),
         };
 
         Examples::new(
@@ -1161,6 +1165,7 @@ impl RpcExampleProvider {
                 version: SequenceNumber::from_u64(1),
                 digest: ObjectDigest::new(self.rng.gen()),
             })
+            .map(Into::into)
             .collect::<Vec<_>>();
 
         let next_cursor = ObjectID::new(self.rng.gen());
@@ -1206,7 +1211,7 @@ impl RpcExampleProvider {
                     },
                     MoveStructLayout {
                         type_: struct_tag,
-                        fields: Box::new(Vec::new()),
+                        fields: Vec::new(),
                     },
                 )
                 .unwrap(),
@@ -1314,7 +1319,7 @@ impl RpcExampleProvider {
                 sender: SuiAddress::from(ObjectID::new(self.rng.gen())),
                 type_: StructTag::from_str("0x3::test::Test<0x3::test::Test>").unwrap(),
                 parsed_json: serde_json::Value::String("some_value".to_string()),
-                bcs: vec![],
+                bcs: BcsEvent::new(vec![]),
                 timestamp_ms: None,
             })
             .collect();

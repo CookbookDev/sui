@@ -59,11 +59,24 @@ impl<C: NetworkClient, S: NetworkService> Subscriber<C, S> {
         let context = self.context.clone();
         let network_client = self.network_client.clone();
         let authority_service = self.authority_service.clone();
-        let last_received = self
-            .dag_state
-            .read()
-            .get_last_block_for_authority(peer)
-            .round();
+        let (mut last_received, gc_round, gc_enabled) = {
+            let dag_state = self.dag_state.read();
+            (
+                dag_state.get_last_block_for_authority(peer).round(),
+                dag_state.gc_round(),
+                dag_state.gc_enabled(),
+            )
+        };
+
+        // If the latest block we have accepted by an authority is older than the current gc round,
+        // then do not attempt to fetch any blocks from that point as they will simply be skipped. Instead
+        // do attempt to fetch from the gc round.
+        if gc_enabled && last_received < gc_round {
+            info!(
+                "Last received block for peer {peer} is older than GC round, {last_received} < {gc_round}, fetching from GC round"
+            );
+            last_received = gc_round;
+        }
 
         let mut subscriptions = self.subscriptions.lock();
         self.unsubscribe_locked(peer, &mut subscriptions[peer.value()]);
@@ -93,7 +106,7 @@ impl<C: NetworkClient, S: NetworkService> Subscriber<C, S> {
         self.context
             .metrics
             .node_metrics
-            .subscriber_connections
+            .subscribed_to
             .with_label_values(&[peer_hostname])
             .set(0);
     }
@@ -117,7 +130,7 @@ impl<C: NetworkClient, S: NetworkService> Subscriber<C, S> {
             context
                 .metrics
                 .node_metrics
-                .subscriber_connections
+                .subscribed_to
                 .with_label_values(&[peer_hostname])
                 .set(0);
 
@@ -147,7 +160,10 @@ impl<C: NetworkClient, S: NetworkService> Subscriber<C, S> {
                 .await
             {
                 Ok(blocks) => {
-                    debug!("Subscribed to peer {} after {} attempts", peer, retries);
+                    debug!(
+                        "Subscribed to peer {} {} after {} attempts",
+                        peer, peer_hostname, retries
+                    );
                     context
                         .metrics
                         .node_metrics
@@ -157,7 +173,10 @@ impl<C: NetworkClient, S: NetworkService> Subscriber<C, S> {
                     blocks
                 }
                 Err(e) => {
-                    debug!("Failed to subscribe to blocks from peer {}: {}", peer, e);
+                    debug!(
+                        "Failed to subscribe to blocks from peer {} {}: {}",
+                        peer, peer_hostname, e
+                    );
                     context
                         .metrics
                         .node_metrics
@@ -169,11 +188,10 @@ impl<C: NetworkClient, S: NetworkService> Subscriber<C, S> {
             };
 
             // Now can consider the subscription successful
-            let peer_hostname = &context.committee.authority(peer).hostname;
             context
                 .metrics
                 .node_metrics
-                .subscriber_connections
+                .subscribed_to
                 .with_label_values(&[peer_hostname])
                 .set(1);
 
@@ -193,12 +211,15 @@ impl<C: NetworkClient, S: NetworkService> Subscriber<C, S> {
                             match e {
                                 ConsensusError::BlockRejected { block_ref, reason } => {
                                     debug!(
-                                        "Failed to process block from peer {} for block {:?}: {}",
-                                        peer, block_ref, reason
+                                        "Failed to process block from peer {} {} for block {:?}: {}",
+                                        peer, peer_hostname, block_ref, reason
                                     );
                                 }
                                 _ => {
-                                    info!("Invalid block received from peer {}: {}", peer, e,);
+                                    info!(
+                                        "Invalid block received from peer {} {}: {}",
+                                        peer, peer_hostname, e
+                                    );
                                 }
                             }
                         }
@@ -206,7 +227,10 @@ impl<C: NetworkClient, S: NetworkService> Subscriber<C, S> {
                         retries = 0;
                     }
                     None => {
-                        debug!("Subscription to blocks from peer {} ended", peer);
+                        debug!(
+                            "Subscription to blocks from peer {} {} ended",
+                            peer, peer_hostname
+                        );
                         retries += 1;
                         break 'stream;
                     }
@@ -224,11 +248,12 @@ mod test {
 
     use super::*;
     use crate::{
-        block::{BlockRef, VerifiedBlock},
+        block::BlockRef,
         commit::CommitRange,
         error::ConsensusResult,
-        network::{test_network::TestService, BlockStream},
+        network::{test_network::TestService, BlockStream, ExtendedSerializedBlock},
         storage::mem_store::MemStore,
+        VerifiedBlock,
     };
 
     struct SubscriberTestClient {}
@@ -260,7 +285,11 @@ mod test {
         ) -> ConsensusResult<BlockStream> {
             let block_stream = stream::unfold((), |_| async {
                 sleep(Duration::from_millis(1)).await;
-                Some((Bytes::from(vec![1u8; 8]), ()))
+                let block = ExtendedSerializedBlock {
+                    block: Bytes::from(vec![1u8; 8]),
+                    excluded_ancestors: vec![],
+                };
+                Some((block, ()))
             })
             .take(10);
             Ok(Box::pin(block_stream))
@@ -291,6 +320,14 @@ mod test {
             _authorities: Vec<AuthorityIndex>,
             _timeout: Duration,
         ) -> ConsensusResult<Vec<Bytes>> {
+            unimplemented!("Unimplemented")
+        }
+
+        async fn get_latest_rounds(
+            &self,
+            _peer: AuthorityIndex,
+            _timeout: Duration,
+        ) -> ConsensusResult<(Vec<Round>, Vec<Round>)> {
             unimplemented!("Unimplemented")
         }
     }
@@ -328,7 +365,13 @@ mod test {
         assert!(service.handle_send_block.len() >= 100);
         for (p, block) in service.handle_send_block.iter() {
             assert_eq!(*p, peer);
-            assert_eq!(*block, Bytes::from(vec![1u8; 8]));
+            assert_eq!(
+                *block,
+                ExtendedSerializedBlock {
+                    block: Bytes::from(vec![1u8; 8]),
+                    excluded_ancestors: vec![]
+                }
+            );
         }
     }
 }

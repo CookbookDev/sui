@@ -2,7 +2,7 @@
 // Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::compiler::{as_module, compile_units};
+use crate::compiler::{as_module, compile_units, serialize_module_at_max_version};
 use move_binary_format::errors::{Location, PartialVMError, VMError};
 use move_core_types::{
     account_address::AccountAddress,
@@ -32,7 +32,7 @@ fn test_malformed_module() {
     let m = as_module(units.pop().unwrap());
 
     let mut blob = vec![];
-    m.serialize(&mut blob).unwrap();
+    serialize_module_at_max_version(&m, &mut blob).unwrap();
 
     let module_id = ModuleId::new(TEST_ADDR, Identifier::new("M").unwrap());
     let fun_name = Identifier::new("foo").unwrap();
@@ -49,6 +49,7 @@ fn test_malformed_module() {
             vec![],
             Vec::<Vec<u8>>::new(),
             &mut UnmeteredGasMeter,
+            None,
         )
         .unwrap();
     }
@@ -75,6 +76,7 @@ fn test_malformed_module() {
                 vec![],
                 Vec::<Vec<u8>>::new(),
                 &mut UnmeteredGasMeter,
+                None,
             )
             .unwrap_err();
         assert_eq!(err.status_type(), StatusType::InvariantViolation);
@@ -102,7 +104,7 @@ fn test_unverifiable_module() {
         let mut storage = InMemoryStorage::new();
 
         let mut blob = vec![];
-        m.serialize(&mut blob).unwrap();
+        serialize_module_at_max_version(&m, &mut blob).unwrap();
         storage.publish_or_overwrite_module(m.self_id(), blob);
 
         let vm = MoveVM::new(vec![]).unwrap();
@@ -114,6 +116,7 @@ fn test_unverifiable_module() {
             vec![],
             Vec::<Vec<u8>>::new(),
             &mut UnmeteredGasMeter,
+            None,
         )
         .unwrap();
     }
@@ -126,7 +129,7 @@ fn test_unverifiable_module() {
         let mut m = m;
         m.function_defs[0].code.as_mut().unwrap().code = vec![];
         let mut blob = vec![];
-        m.serialize(&mut blob).unwrap();
+        serialize_module_at_max_version(&m, &mut blob).unwrap();
         storage.publish_or_overwrite_module(m.self_id(), blob);
 
         let vm = MoveVM::new(vec![]).unwrap();
@@ -139,6 +142,7 @@ fn test_unverifiable_module() {
                 vec![],
                 Vec::<Vec<u8>>::new(),
                 &mut UnmeteredGasMeter,
+                None,
             )
             .unwrap_err();
 
@@ -166,9 +170,9 @@ fn test_missing_module_dependency() {
     let m = as_module(units.pop().unwrap());
 
     let mut blob_m = vec![];
-    m.serialize(&mut blob_m).unwrap();
+    serialize_module_at_max_version(&m, &mut blob_m).unwrap();
     let mut blob_n = vec![];
-    n.serialize(&mut blob_n).unwrap();
+    serialize_module_at_max_version(&n, &mut blob_n).unwrap();
 
     let module_id = ModuleId::new(TEST_ADDR, Identifier::new("N").unwrap());
     let fun_name = Identifier::new("bar").unwrap();
@@ -189,6 +193,7 @@ fn test_missing_module_dependency() {
             vec![],
             Vec::<Vec<u8>>::new(),
             &mut UnmeteredGasMeter,
+            None,
         )
         .unwrap();
     }
@@ -209,6 +214,7 @@ fn test_missing_module_dependency() {
                 vec![],
                 Vec::<Vec<u8>>::new(),
                 &mut UnmeteredGasMeter,
+                None,
             )
             .unwrap_err();
 
@@ -236,9 +242,9 @@ fn test_malformed_module_dependency() {
     let m = as_module(units.pop().unwrap());
 
     let mut blob_m = vec![];
-    m.serialize(&mut blob_m).unwrap();
+    serialize_module_at_max_version(&m, &mut blob_m).unwrap();
     let mut blob_n = vec![];
-    n.serialize(&mut blob_n).unwrap();
+    serialize_module_at_max_version(&n, &mut blob_n).unwrap();
 
     let module_id = ModuleId::new(TEST_ADDR, Identifier::new("N").unwrap());
     let fun_name = Identifier::new("bar").unwrap();
@@ -259,6 +265,7 @@ fn test_malformed_module_dependency() {
             vec![],
             Vec::<Vec<u8>>::new(),
             &mut UnmeteredGasMeter,
+            None,
         )
         .unwrap();
     }
@@ -285,6 +292,7 @@ fn test_malformed_module_dependency() {
                 vec![],
                 Vec::<Vec<u8>>::new(),
                 &mut UnmeteredGasMeter,
+                None,
             )
             .unwrap_err();
 
@@ -312,7 +320,7 @@ fn test_unverifiable_module_dependency() {
     let m = as_module(units.pop().unwrap());
 
     let mut blob_n = vec![];
-    n.serialize(&mut blob_n).unwrap();
+    serialize_module_at_max_version(&n, &mut blob_n).unwrap();
 
     let module_id = ModuleId::new(TEST_ADDR, Identifier::new("N").unwrap());
     let fun_name = Identifier::new("bar").unwrap();
@@ -320,7 +328,7 @@ fn test_unverifiable_module_dependency() {
     // Publish M and N and call N::bar. Everything should work.
     {
         let mut blob_m = vec![];
-        m.serialize(&mut blob_m).unwrap();
+        serialize_module_at_max_version(&m, &mut blob_m).unwrap();
 
         let mut storage = InMemoryStorage::new();
 
@@ -336,6 +344,7 @@ fn test_unverifiable_module_dependency() {
             vec![],
             Vec::<Vec<u8>>::new(),
             &mut UnmeteredGasMeter,
+            None,
         )
         .unwrap();
     }
@@ -345,7 +354,7 @@ fn test_unverifiable_module_dependency() {
         let mut m = m;
         m.function_defs[0].code.as_mut().unwrap().code = vec![];
         let mut blob_m = vec![];
-        m.serialize(&mut blob_m).unwrap();
+        serialize_module_at_max_version(&m, &mut blob_m).unwrap();
 
         let mut storage = InMemoryStorage::new();
 
@@ -362,6 +371,7 @@ fn test_unverifiable_module_dependency() {
                 vec![],
                 Vec::<Vec<u8>>::new(),
                 &mut UnmeteredGasMeter,
+                None,
             )
             .unwrap_err();
 
@@ -431,6 +441,7 @@ fn test_storage_returns_bogus_error_when_loading_module() {
                 vec![],
                 Vec::<Vec<u8>>::new(),
                 &mut UnmeteredGasMeter,
+                None,
             )
             .unwrap_err();
 

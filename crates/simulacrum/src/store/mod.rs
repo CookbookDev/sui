@@ -12,7 +12,7 @@ use sui_types::transaction::ReceivingObjects;
 use sui_types::{
     base_types::{ObjectID, SequenceNumber, SuiAddress},
     committee::{Committee, EpochId},
-    digests::{ObjectDigest, TransactionDigest, TransactionEventsDigest},
+    digests::{ObjectDigest, TransactionDigest},
     effects::{TransactionEffects, TransactionEffectsAPI, TransactionEvents},
     error::SuiResult,
     messages_checkpoint::{
@@ -74,13 +74,7 @@ pub trait SimulatorStore:
 
     fn get_transaction_effects(&self, digest: &TransactionDigest) -> Option<TransactionEffects>;
 
-    fn get_transaction_events(&self, digest: &TransactionEventsDigest)
-        -> Option<TransactionEvents>;
-
-    fn get_transaction_events_by_tx_digest(
-        &self,
-        tx_digest: &TransactionDigest,
-    ) -> Option<TransactionEvents>;
+    fn get_transaction_events(&self, digest: &TransactionDigest) -> Option<TransactionEvents>;
 
     fn get_object(&self, id: &ObjectID) -> Option<Object>;
 
@@ -137,7 +131,7 @@ pub trait SimulatorStore:
                     crate::store::SimulatorStore::get_object(self, id)
                 }
                 InputObjectKind::ImmOrOwnedMoveObject(objref) => {
-                    self.get_object_by_key(&objref.0, objref.1)?
+                    self.get_object_by_key(&objref.0, objref.1)
                 }
 
                 InputObjectKind::SharedMoveObject { id, .. } => {

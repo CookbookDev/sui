@@ -8,6 +8,7 @@ use crate::authority::AuthorityState;
 use move_core_types::ident_str;
 use move_core_types::language_storage::{StructTag, TypeTag};
 use std::sync::Arc;
+use sui_protocol_config::{Chain, PerObjectCongestionControlMode, ProtocolConfig, ProtocolVersion};
 use sui_test_transaction_builder::TestTransactionBuilder;
 use sui_types::base_types::{dbg_addr, ObjectID, ObjectRef, SuiAddress};
 use sui_types::crypto::{get_account_key_pair, AccountKeyPair};
@@ -30,7 +31,7 @@ async fn test_regulated_coin_v1_creation() {
     let mut metadata_object = None;
     let mut regulated_metadata_object = None;
     for (oref, _owner) in env.publish_effects.created() {
-        let object = env.authority.get_object(&oref.0).await.unwrap().unwrap();
+        let object = env.authority.get_object(&oref.0).await.unwrap();
         if object.is_package() {
             continue;
         }
@@ -82,7 +83,7 @@ async fn test_regulated_coin_v2_types() {
     let mut regulated_metadata_object = None;
     let mut package_id = None;
     for (oref, _owner) in env.publish_effects.created() {
-        let object = env.authority.get_object(&oref.0).await.unwrap().unwrap();
+        let object = env.authority.get_object(&oref.0).await.unwrap();
         if object.is_package() {
             package_id = Some(object.id());
             continue;
@@ -267,7 +268,6 @@ impl TestEnv {
             .get_object(id)
             .await
             .unwrap()
-            .unwrap()
             .compute_object_reference()
     }
 }
@@ -276,8 +276,15 @@ async fn new_authority_and_publish(path: &str) -> TestEnv {
     let (sender, keypair) = get_account_key_pair();
     let gas_object = Object::with_owner_for_testing(sender);
     let gas_object_id = gas_object.id();
+
+    let mut protocol_config =
+        ProtocolConfig::get_for_version(ProtocolVersion::max(), Chain::Unknown);
+    protocol_config
+        .set_per_object_congestion_control_mode_for_testing(PerObjectCongestionControlMode::None);
+
     let authority = TestAuthorityBuilder::new()
         .with_starting_objects(&[gas_object])
+        .with_protocol_config(protocol_config)
         .build()
         .await;
     let rgp = authority.reference_gas_price_for_testing().unwrap();

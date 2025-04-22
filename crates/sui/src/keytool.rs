@@ -3,6 +3,11 @@
 use crate::key_identity::{get_identity_address_from_keystore, KeyIdentity};
 use crate::zklogin_commands_util::{perform_zk_login_test_tx, read_cli_line};
 use anyhow::anyhow;
+use aws_sdk_kms::{
+    primitives::Blob,
+    types::{MessageType, SigningAlgorithmSpec},
+    Client as KmsClient,
+};
 use bip32::DerivationPath;
 use clap::*;
 use fastcrypto::ed25519::Ed25519KeyPair;
@@ -24,8 +29,6 @@ use num_bigint::BigUint;
 use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
-use rusoto_core::Region;
-use rusoto_kms::{Kms, KmsClient, SignRequest};
 use serde::Serialize;
 use serde_json::json;
 use shared_crypto::intent::{Intent, IntentMessage, IntentScope, PersonalMessage};
@@ -191,7 +194,7 @@ pub enum KeyToolCommand {
     /// [enum SuiKeyPair] (Base64 encoded of 33-byte `flag || privkey`) or `type AuthorityKeyPair`
     /// (Base64 encoded `privkey`). It prints its Base64 encoded public key and the key scheme flag.
     Show { file: PathBuf },
-    /// Create signature using the private key for for the given address (or its alias) in sui keystore.
+    /// Create signature using the private key for the given address (or its alias) in sui keystore.
     /// Any signature commits to a [struct IntentMessage] consisting of the Base64 encoded
     /// of the BCS serialized transaction bytes itself and its intent. If intent is absent,
     /// default will be used.
@@ -435,7 +438,10 @@ pub struct ZkLoginSignAndExecuteTx {
 #[serde(rename_all = "camelCase")]
 pub struct ZkLoginSigVerifyResponse {
     data: Option<String>,
-    parsed: Option<String>,
+    iss: String,
+    address_seed: String,
+    kid: String,
+    parsed: String,
     jwks: Option<String>,
     res: Option<SuiResult>,
 }
@@ -629,8 +635,15 @@ impl KeyToolCommand {
                 match SuiKeyPair::decode(&input_string) {
                     Ok(skp) => {
                         info!("Importing Bech32 encoded private key to keystore");
-                        let key = Key::from(&skp);
-                        keystore.add_key(alias, skp)?;
+                        let mut key = Key::from(&skp);
+                        keystore.add_key(alias.clone(), skp)?;
+
+                        let alias = match alias {
+                            Some(x) => x,
+                            None => keystore.get_alias_by_address(&key.sui_address)?,
+                        };
+
+                        key.alias = Some(alias);
                         CommandOutput::Import(key)
                     }
                     Err(_) => {
@@ -639,10 +652,17 @@ impl KeyToolCommand {
                             &input_string,
                             key_scheme,
                             derivation_path,
-                            alias,
+                            alias.clone(),
                         )?;
                         let skp = keystore.get_key(&sui_address)?;
-                        let key = Key::from(skp);
+                        let mut key = Key::from(skp);
+
+                        let alias = match alias {
+                            Some(x) => x,
+                            None => keystore.get_alias_by_address(&key.sui_address)?,
+                        };
+
+                        key.alias = Some(alias);
                         CommandOutput::Import(key)
                     }
                 }
@@ -861,27 +881,24 @@ impl KeyToolCommand {
                 info!("Digest to sign: {:?}", Base64::encode(digest));
 
                 // Set up the KMS client in default region.
-                let region: Region = Region::default();
-                let kms: KmsClient = KmsClient::new(region);
-
-                // Construct the signing request.
-                let request: SignRequest = SignRequest {
-                    key_id: keyid.to_string(),
-                    message: digest.to_vec().into(),
-                    message_type: Some("RAW".to_string()),
-                    signing_algorithm: "ECDSA_SHA_256".to_string(),
-                    ..Default::default()
-                };
+                let config = aws_config::load_from_env().await;
+                let kms = KmsClient::new(&config);
 
                 // Sign the message, normalize the signature and then compacts it
-                // serialize_compact is loaded as bytes for Secp256k1Sinaturere
-                let response = kms.sign(request).await?;
+                // serialize_compact is loaded as bytes for Secp256k1Signature
+                let response = kms
+                    .sign()
+                    .key_id(keyid)
+                    .message_type(MessageType::Raw)
+                    .message(Blob::new(digest))
+                    .signing_algorithm(SigningAlgorithmSpec::EcdsaSha256)
+                    .send()
+                    .await?;
                 let sig_bytes_der = response
                     .signature
-                    .map(|b| b.to_vec())
                     .expect("Requires Asymmetric Key Generated in KMS");
 
-                let mut external_sig = Secp256k1Sig::from_der(&sig_bytes_der)?;
+                let mut external_sig = Secp256k1Sig::from_der(sig_bytes_der.as_ref())?;
                 external_sig.normalize_s();
                 let sig_compact = external_sig.serialize_compact();
 
@@ -951,7 +968,7 @@ impl KeyToolCommand {
                 )
                 .await
                 .unwrap();
-                let (_, aud) = parse_and_validate_jwt(&parsed_token).unwrap();
+                let (_, aud, _) = parse_and_validate_jwt(&parsed_token).unwrap();
                 let address_seed = gen_address_seed(user_salt, "sub", sub, &aud).unwrap();
                 let zk_login_inputs =
                     ZkLoginInputs::from_reader(reader, &address_seed.to_string()).unwrap();
@@ -1114,6 +1131,23 @@ impl KeyToolCommand {
                     "https://api.ambrus.studio/callback",
                     &jwt_randomness,
                 )?;
+                let url_14 = get_oidc_url(
+                    OIDCProvider::Arden,
+                    &eph_pk_bytes,
+                    max_epoch,
+                    "2e3i87cb-bf24-4399-ab98-48343d457124",
+                    "https://www.sui.io",
+                    &jwt_randomness,
+                )?;
+                let url_15 = get_oidc_url(
+                    OIDCProvider::AwsTenant(("eu-west-3".to_string(), "trace".to_string())),
+                    &eph_pk_bytes,
+                    max_epoch,
+                    "trace-dev",
+                    "https://trace.fan",
+                    &jwt_randomness,
+                )?;
+                // This is only for CLI testing. If frontend apps will be built, no need to add anything here.
                 println!("Visit URL (Google): {url}");
                 println!("Visit URL (Twitch): {url_2}");
                 println!("Visit URL (Facebook): {url_3}");
@@ -1128,6 +1162,8 @@ impl KeyToolCommand {
                 println!("Visit URL (KarrierOne): {url_11}");
                 println!("Visit URL (Credenza3): {url_12}");
                 println!("Visit URL (AWS - Ambrus): {url_13}");
+                println!("Visit URL (Arden): {url_14}");
+                println!("Visit URL (AWS - Trace): {url_15}");
 
                 println!("Finish login and paste the entire URL here (e.g. https://sui.io/#id_token=...):");
 
@@ -1185,7 +1221,10 @@ impl KeyToolCommand {
                         if bytes.is_none() || cur_epoch.is_none() {
                             return Ok(CommandOutput::ZkLoginSigVerify(ZkLoginSigVerifyResponse {
                                 data: None,
-                                parsed: Some(serde_json::to_string(&zk)?),
+                                parsed: serde_json::to_string(&zk)?,
+                                iss: zk.inputs.get_iss().to_owned(),
+                                kid: zk.inputs.get_kid().to_owned(),
+                                address_seed: zk.inputs.get_address_seed().to_string(),
                                 res: None,
                                 jwks: None,
                             }));
@@ -1202,7 +1241,7 @@ impl KeyToolCommand {
                             _ => return Err(anyhow!("Invalid network")),
                         };
                         let verify_params =
-                            VerifyParams::new(parsed, vec![], env, true, true, Some(2));
+                            VerifyParams::new(parsed, vec![], env, true, true, true, Some(2));
 
                         let (serialized, res) = match IntentScope::try_from(intent_scope)
                             .map_err(|_| anyhow!("Invalid scope"))?
@@ -1244,7 +1283,10 @@ impl KeyToolCommand {
                         };
                         CommandOutput::ZkLoginSigVerify(ZkLoginSigVerifyResponse {
                             data: Some(serialized),
-                            parsed: Some(serde_json::to_string(&zk)?),
+                            parsed: serde_json::to_string(&zk)?,
+                            iss: zk.inputs.get_iss().to_owned(),
+                            kid: zk.inputs.get_kid().to_owned(),
+                            address_seed: zk.inputs.get_address_seed().to_string(),
                             jwks: Some(serde_json::to_string(&jwks)?),
                             res: Some(res),
                         })

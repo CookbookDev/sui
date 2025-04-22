@@ -68,6 +68,10 @@ pub struct Test {
     /// The number of iterations to run each test that uses generated values (only used with #[random_test]).
     #[clap(name = "rand-num-iters", long = "rand-num-iters")]
     pub rand_num_iters: Option<u64>,
+
+    // Enable tracing for tests
+    #[clap(long = "trace-execution")]
+    pub trace_execution: bool,
 }
 
 impl Test {
@@ -80,6 +84,8 @@ impl Test {
     ) -> anyhow::Result<()> {
         let rerooted_path = reroot_path(path)?;
         let compute_coverage = self.compute_coverage;
+        // save disassembly if trace execution is enabled
+        let save_disassembly = self.trace_execution;
         let result = run_move_unit_tests(
             &rerooted_path,
             config,
@@ -87,6 +93,7 @@ impl Test {
             natives,
             cost_table,
             compute_coverage,
+            save_disassembly,
             &mut std::io::stdout(),
         )?;
 
@@ -108,6 +115,7 @@ impl Test {
             compute_coverage: _,
             seed,
             rand_num_iters,
+            trace_execution,
         } = self;
         UnitTestingConfig {
             gas_limit,
@@ -118,6 +126,7 @@ impl Test {
             verbose: verbose_mode,
             seed,
             rand_num_iters,
+            trace_execution,
             ..UnitTestingConfig::default_with_bound(None)
         }
     }
@@ -137,11 +146,13 @@ pub fn run_move_unit_tests<W: Write + Send>(
     natives: Vec<NativeFunctionRecord>,
     cost_table: Option<CostTable>,
     compute_coverage: bool,
+    save_disassembly: bool,
     writer: &mut W,
 ) -> Result<(UnitTestResult, Option<Diagnostics>)> {
     let mut test_plan = None;
     build_config.test_mode = true;
     build_config.dev_mode = true;
+    build_config.save_disassembly = save_disassembly;
 
     // Build the resolution graph (resolution graph diagnostics are only needed for CLI commands so
     // ignore them by passing a vector as the writer)
@@ -179,7 +190,7 @@ pub fn run_move_unit_tests<W: Write + Send>(
     }
 
     let root_package = resolution_graph.root_package();
-    let build_plan = BuildPlan::create(resolution_graph)?;
+    let build_plan = BuildPlan::create(&resolution_graph)?;
 
     // Compile the package. We need to intercede in the compilation, process being performed by the
     // Move package system, to first grab the compilation env, construct the test plan from it, and
@@ -188,9 +199,9 @@ pub fn run_move_unit_tests<W: Write + Send>(
     let mut warning_diags = None;
     build_plan.compile_with_driver(writer, |compiler| {
         let (files, comments_and_compiler_res) = compiler.run::<PASS_CFGIR>().unwrap();
-        let (_, compiler) =
+        let compiler =
             diagnostics::unwrap_or_report_pass_diagnostics(&files, comments_and_compiler_res);
-        let (mut compiler, cfgir) = compiler.into_ast();
+        let (compiler, cfgir) = compiler.into_ast();
         let compilation_env = compiler.compilation_env();
         let built_test_plan = construct_test_plan(compilation_env, Some(root_package), &cfgir);
         let mapped_files = compilation_env.mapped_files().clone();

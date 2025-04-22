@@ -1,22 +1,15 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{
-    sync::{Arc, Weak},
-    time::Duration,
-};
+use std::sync::{Arc, Weak};
 
+use mysten_common::{fatal, random::get_rng};
 use mysten_metrics::{monitored_scope, spawn_monitored_task};
-use rand::{
-    rngs::{OsRng, StdRng},
-    Rng, SeedableRng,
-};
+use rand::Rng;
 use sui_macros::fail_point_async;
-use tokio::{
-    sync::{mpsc::UnboundedReceiver, oneshot, Semaphore},
-    time::sleep,
-};
-use tracing::{error, error_span, info, trace, Instrument};
+use sui_types::error::SuiError;
+use tokio::sync::{mpsc::UnboundedReceiver, oneshot, Semaphore};
+use tracing::{error_span, info, trace, warn, Instrument};
 
 use crate::authority::AuthorityState;
 use crate::transaction_manager::PendingCertificate;
@@ -25,10 +18,6 @@ use crate::transaction_manager::PendingCertificate;
 #[path = "unit_tests/execution_driver_tests.rs"]
 mod execution_driver_tests;
 
-// Execution should not encounter permanent failures, so any failure can and needs
-// to be retried.
-pub const EXECUTION_MAX_ATTEMPTS: u32 = 10;
-const EXECUTION_FAILURE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const QUEUEING_DELAY_SAMPLING_RATIO: f64 = 0.05;
 
 /// When a notification that a new pending transaction is received we activate
@@ -42,7 +31,6 @@ pub async fn execution_process(
 
     // Rate limit concurrent executions to # of cpus.
     let limit = Arc::new(Semaphore::new(num_cpus::get()));
-    let mut rng = StdRng::from_rng(&mut OsRng).unwrap();
 
     // Loop whenever there is a signal that a new transactions is ready to process.
     loop {
@@ -86,12 +74,22 @@ pub async fn execution_process(
         let digest = *certificate.digest();
         trace!(?digest, "Pending certificate execution activated.");
 
+        if epoch_store.epoch() != certificate.epoch() {
+            info!(
+                ?digest,
+                cur_epoch = epoch_store.epoch(),
+                cert_epoch = certificate.epoch(),
+                "Ignoring certificate from previous epoch."
+            );
+            continue;
+        }
+
         let limit = limit.clone();
         // hold semaphore permit until task completes. unwrap ok because we never close
         // the semaphore in this context.
         let permit = limit.acquire_owned().await.unwrap();
 
-        if rng.gen_range(0.0..1.0) < QUEUEING_DELAY_SAMPLING_RATIO {
+        if get_rng().gen_range(0.0..1.0) < QUEUEING_DELAY_SAMPLING_RATIO {
             authority
                 .metrics
                 .execution_queueing_latency
@@ -107,35 +105,34 @@ pub async fn execution_process(
         authority.metrics.execution_rate_tracker.lock().record();
 
         // Certificate execution can take significant time, so run it in a separate task.
-        spawn_monitored_task!(async move {
+        let epoch_store_clone = epoch_store.clone();
+        spawn_monitored_task!(epoch_store.within_alive_epoch(async move {
             let _scope = monitored_scope("ExecutionDriver::task");
             let _guard = permit;
-            if let Ok(true) = authority.is_tx_already_executed(&digest) {
+            if authority.is_tx_already_executed(&digest) {
                 return;
             }
-            let mut attempts = 0;
-            loop {
-                fail_point_async!("transaction_execution_delay");
-                attempts += 1;
-                let res = authority
-                    .try_execute_immediately(&certificate, expected_effects_digest, &epoch_store)
-                    .await;
-                if let Err(e) = res {
-                    if attempts == EXECUTION_MAX_ATTEMPTS {
-                        panic!("Failed to execute certified transaction {digest:?} after {attempts} attempts! error={e} certificate={certificate:?}");
-                    }
-                    // Assume only transient failure can happen. Permanent failure is probably
-                    // a bug. There is nothing that can be done to recover from permanent failures.
-                    error!(tx_digest=?digest, "Failed to execute certified transaction {digest:?}! attempt {attempts}, {e}");
-                    sleep(EXECUTION_FAILURE_RETRY_INTERVAL).await;
-                } else {
-                    break;
+
+            fail_point_async!("transaction_execution_delay");
+
+            match authority.try_execute_immediately(
+                &certificate,
+                expected_effects_digest,
+                &epoch_store_clone,
+            ).await {
+                Err(SuiError::ValidatorHaltedAtEpochEnd) => {
+                    warn!("Could not execute transaction {digest:?} because validator is halted at epoch end. certificate={certificate:?}");
+                    return;
                 }
+                Err(e) => {
+                    fatal!("Failed to execute certified transaction {digest:?}! error={e} certificate={certificate:?}");
+                }
+                _ => (),
             }
             authority
                 .metrics
                 .execution_driver_executed_transactions
                 .inc();
-        }.instrument(error_span!("execution_driver", tx_digest = ?digest)));
+        }.instrument(error_span!("execution_driver", tx_digest = ?digest))));
     }
 }

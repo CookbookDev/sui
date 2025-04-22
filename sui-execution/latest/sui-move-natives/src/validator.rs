@@ -33,7 +33,7 @@ pub fn validate_metadata_bcs(
 
     let validator_validate_metadata_bcs_cost_params = context
         .extensions_mut()
-        .get::<NativesCostTable>()
+        .get::<NativesCostTable>()?
         .validator_validate_metadata_bcs_cost_params
         .clone();
 
@@ -53,7 +53,7 @@ pub fn validate_metadata_bcs(
     let validator_metadata =
         bcs::from_bytes::<ValidatorMetadataV1>(&metadata_bytes).map_err(|_| {
             PartialVMError::new(StatusCode::MALFORMED).with_message(
-                "ValidateMetadata Move struct does not much internal ValidateMetadata struct"
+                "ValidateMetadata Move struct does not match internal ValidateMetadata struct"
                     .to_string(),
             )
         })?;

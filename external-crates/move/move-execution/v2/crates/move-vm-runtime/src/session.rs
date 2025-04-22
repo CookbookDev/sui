@@ -43,7 +43,7 @@ pub struct SerializedReturnValues {
     pub return_values: Vec<(Vec<u8>, MoveTypeLayout)>,
 }
 
-impl<'r, 'l, S: MoveResolver> Session<'r, 'l, S> {
+impl<'r, S: MoveResolver> Session<'r, '_, S> {
     /// Execute a Move function with the given arguments. This is mainly designed for an external
     /// environment to invoke system logic written in Move.
     ///
@@ -99,7 +99,7 @@ impl<'r, 'l, S: MoveResolver> Session<'r, 'l, S> {
         args: Vec<impl Borrow<[u8]>>,
         gas_meter: &mut impl GasMeter,
     ) -> VMResult<SerializedReturnValues> {
-        move_vm_profiler::gas_profiler_feature_enabled! {
+        move_vm_profiler::tracing_feature_enabled! {
             use move_vm_profiler::GasProfiler;
             if gas_meter.get_profiler_mut().is_none() {
                 gas_meter.set_profiler(GasProfiler::init_default_cfg(

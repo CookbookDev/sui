@@ -7,13 +7,16 @@ repository = "https://github.com/move-language/move"
 license = "Apache-2.0"
 publish = false
 edition = "2021"
+# `move-analyzer` binary built directly out of this crate
+# should not be used "as is", as it's sits somewhere
+# in the middle between supporting Sui and not supporting it (fully)
+autobins = false
 
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
 codespan-reporting.workspace = true
 crossbeam.workspace = true
-derivative.workspace = true
 dunce.workspace = true
 im.workspace = true
 itertools.workspace = true
@@ -23,12 +26,15 @@ lsp-types.workspace = true
 move-command-line-common.workspace = true
 move-compiler.workspace = true
 move-ir-types.workspace = true
+move-core-types.workspace = true
 move-package.workspace = true
 move-symbol-pool.workspace = true
 once_cell.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+strum.workspace = true
+strum_macros.workspace = true
 tempfile.workspace = true
 url.workspace = true
 vfs.workspace = true

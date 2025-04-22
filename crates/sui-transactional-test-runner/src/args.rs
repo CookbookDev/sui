@@ -1,14 +1,19 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::path::PathBuf;
+
 use crate::test_adapter::{FakeID, SuiTestAdapter};
 use anyhow::{bail, ensure};
 use clap;
 use clap::{Args, Parser};
-use move_command_line_common::parser::{parse_u256, parse_u64};
-use move_command_line_common::values::{ParsableValue, ParsedValue};
-use move_command_line_common::{parser::Parser as MoveCLParser, values::ValueToken};
 use move_compiler::editions::Flavor;
+use move_core_types::parsing::{
+    parser::Parser as MoveCLParser,
+    parser::{parse_u256, parse_u64},
+    values::ValueToken,
+    values::{ParsableValue, ParsedValue},
+};
 use move_core_types::runtime_value::{MoveStruct, MoveValue};
 use move_core_types::u256::U256;
 use move_symbol_pool::Symbol;
@@ -70,6 +75,13 @@ pub struct SuiInitArgs {
     /// the indexer.
     #[clap(long = "epochs-to-keep")]
     pub epochs_to_keep: Option<u64>,
+    /// Dir for simulacrum to write checkpoint files to. To be passed to the offchain indexer and
+    /// reader.
+    #[clap(long)]
+    pub data_ingestion_path: Option<PathBuf>,
+    /// URL for the Sui REST API. To be passed to the offchain indexer and reader.
+    #[clap(long)]
+    pub rest_api_url: Option<String>,
 }
 
 #[derive(Debug, clap::Parser)]
@@ -102,12 +114,18 @@ pub struct ConsensusCommitPrologueCommand {
 pub struct ProgrammableTransactionCommand {
     #[clap(long = "sender")]
     pub sender: Option<String>,
+    #[clap(long = "sponsor")]
+    pub sponsor: Option<String>,
     #[clap(long = "gas-budget")]
     pub gas_budget: Option<u64>,
     #[clap(long = "gas-price")]
     pub gas_price: Option<u64>,
+    #[clap(long = "gas-payment", value_parser = parse_fake_id)]
+    pub gas_payment: Option<Vec<FakeID>>,
     #[clap(long = "dev-inspect")]
     pub dev_inspect: bool,
+    #[clap(long = "dry-run")]
+    pub dry_run: bool,
     #[clap(
         long = "inputs",
         value_parser = ParsedValue::<SuiExtraValueArgs>::parse,
@@ -129,6 +147,8 @@ pub struct UpgradePackageCommand {
     pub sender: String,
     #[clap(long = "gas-budget")]
     pub gas_budget: Option<u64>,
+    #[clap(long = "dry-run")]
+    pub dry_run: bool,
     #[clap(long = "syntax")]
     pub syntax: Option<SyntaxChoice>,
     #[clap(long = "policy", default_value="compatible", value_parser = parse_policy)]
@@ -173,6 +193,14 @@ pub struct RunGraphqlCommand {
 }
 
 #[derive(Debug, clap::Parser)]
+pub struct RunJsonRpcCommand {
+    #[clap(long = "show-headers")]
+    pub show_headers: bool,
+    #[clap(long, num_args(1..))]
+    pub cursors: Vec<String>,
+}
+
+#[derive(Debug, clap::Parser)]
 pub struct CreateCheckpointCommand {
     pub count: Option<u64>,
 }
@@ -209,6 +237,7 @@ pub enum SuiSubcommand<ExtraValueArgs: ParsableValue, ExtraRunArgs: Parser> {
     SetRandomState(SetRandomStateCommand),
     ViewCheckpoint,
     RunGraphql(RunGraphqlCommand),
+    RunJsonRpc(RunJsonRpcCommand),
     Bench(RunCommand<ExtraValueArgs>, ExtraRunArgs),
 }
 
@@ -254,6 +283,9 @@ impl<ExtraValueArgs: ParsableValue, ExtraRunArgs: Parser> clap::FromArgMatches
             Some(("run-graphql", matches)) => {
                 SuiSubcommand::RunGraphql(RunGraphqlCommand::from_arg_matches(matches)?)
             }
+            Some(("run-jsonrpc", matches)) => {
+                SuiSubcommand::RunJsonRpc(RunJsonRpcCommand::from_arg_matches(matches)?)
+            }
             Some(("bench", matches)) => SuiSubcommand::Bench(
                 RunCommand::from_arg_matches(matches)?,
                 ExtraRunArgs::from_arg_matches(matches)?,
@@ -291,6 +323,7 @@ impl<ExtraValueArgs: ParsableValue, ExtraRunArgs: Parser> clap::CommandFactory
             .subcommand(SetRandomStateCommand::command().name("set-random-state"))
             .subcommand(clap::Command::new("view-checkpoint"))
             .subcommand(RunGraphqlCommand::command().name("run-graphql"))
+            .subcommand(RunJsonRpcCommand::command().name("run-jsonrpc"))
             .subcommand(
                 RunCommand::<ExtraValueArgs>::augment_args(ExtraRunArgs::command()).name("bench"),
             )
@@ -431,8 +464,8 @@ impl SuiValue {
             sui_types::storage::ObjectStore::get_object(&*test_adapter.executor, &id)
         };
         let obj = match obj_res {
-            Ok(Some(obj)) => obj,
-            Err(_) | Ok(None) => bail!("INVALID TEST. Could not load object argument {}", id),
+            Some(obj) => obj,
+            None => bail!("INVALID TEST. Could not load object argument {}", id),
         };
         Ok(obj)
     }
@@ -477,6 +510,10 @@ impl SuiValue {
         match obj.owner {
             Owner::Shared {
                 initial_shared_version,
+            }
+            | Owner::ConsensusV2 {
+                start_version: initial_shared_version,
+                ..
             } => Ok(ObjectArg::SharedObject {
                 id,
                 initial_shared_version,

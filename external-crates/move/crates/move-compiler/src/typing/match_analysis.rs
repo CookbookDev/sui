@@ -3,12 +3,12 @@
 
 use crate::{
     diag,
+    diagnostics::warning_filters::WarningFilters,
     expansion::ast::{ModuleIdent, Value_},
     ice,
     naming::ast::BuiltinTypeName_,
     parser::ast::{DatatypeName, VariantName},
     shared::{
-        ast_debug::AstDebug,
         ide::{IDEAnnotation, MissingMatchArmsInfo, PatternSuggestion},
         matching::{MatchContext, PatternMatrix},
         string_utils::{debug_print, format_oxford_list},
@@ -38,22 +38,22 @@ use std::{
 // Entry and Visitor
 //**************************************************************************************************
 
-struct MatchCompiler<'ctx, 'env> {
-    context: &'ctx mut Context<'env>,
+struct MatchCompiler<'ctx, 'outer, 'env> {
+    context: &'ctx mut Context<'outer, 'env>,
 }
 
-impl TypingMutVisitorContext for MatchCompiler<'_, '_> {
+impl TypingMutVisitorContext for MatchCompiler<'_, '_, '_> {
     fn visit_exp_custom(&mut self, exp: &mut T::Exp) -> bool {
         use T::UnannotatedExp_ as E;
         let eloc = exp.exp.loc;
         if let E::Match(subject, arms) = &exp.exp.value {
-            debug_print!(self.context.debug.match_counterexample,
+            debug_print!(self.context.debug().match_counterexample,
                 ("subject" => subject),
                 (lines "arms" => &arms.value)
             );
             if invalid_match(self.context, eloc, subject, arms) {
                 debug_print!(
-                    self.context.debug.match_counterexample,
+                    self.context.debug().match_counterexample,
                     (msg "counterexample found")
                 );
                 let err_exp = T::exp(
@@ -70,12 +70,12 @@ impl TypingMutVisitorContext for MatchCompiler<'_, '_> {
         }
     }
 
-    fn add_warning_filter_scope(&mut self, filter: crate::diagnostics::WarningFilters) {
-        self.context.env.add_warning_filter_scope(filter);
+    fn push_warning_filter_scope(&mut self, filter: WarningFilters) {
+        self.context.push_warning_filter_scope(filter);
     }
 
     fn pop_warning_filter_scope(&mut self) {
-        self.context.env.pop_warning_filter_scope();
+        self.context.pop_warning_filter_scope();
     }
 }
 
@@ -105,7 +105,7 @@ fn invalid_match(
     let mut counterexample_matrix = pattern_matrix.clone();
     let has_guards = counterexample_matrix.has_guards();
     counterexample_matrix.remove_guarded_arms();
-    if context.env.ide_mode() {
+    if context.env().ide_mode() {
         // Do this first, as it's a borrow and a shallow walk.
         ide_report_missing_arms(context, arms_loc, &counterexample_matrix);
     }
@@ -233,8 +233,8 @@ fn find_counterexample(
     // If the matrix is only errors (or empty), it was all error or something else (like typing)
     // went wrong; no counterexample is required.
     if !matrix.is_empty() && !matrix.patterns_empty() && matrix.all_errors() {
-        debug_print!(context.debug.match_counterexample, (msg "errors"), ("matrix" => matrix; dbg));
-        assert!(context.env.has_errors());
+        debug_print!(context.debug().match_counterexample, (msg "errors"), ("matrix" => matrix; dbg));
+        assert!(context.env().has_errors());
         return true;
     }
     find_counterexample_impl(context, loc, matrix, has_guards)
@@ -365,23 +365,21 @@ fn find_counterexample_impl(
         datatype_name: DatatypeName,
     ) -> Option<Vec<CounterExample>> {
         debug_print!(
-            context.debug.match_counterexample,
+            context.debug().match_counterexample,
             (lines "matrix types" => &matrix.tys; verbose)
         );
-        if context.modules.is_struct(&mident, &datatype_name) {
+        if context.info().is_struct(&mident, &datatype_name) {
             // For a struct, we only care if we destructure it. If we do, we want to specialize and
             // recur. If we don't, we check it as a default specialization.
             if let Some((ploc, arg_types)) = matrix.first_struct_ctors() {
                 let ctor_arity = arg_types.len() as u32;
                 let decl_fields = context
-                    .modules
+                    .info()
                     .struct_fields(&mident, &datatype_name)
                     .unwrap();
                 let fringe_binders =
                     context.make_imm_ref_match_binders(decl_fields, ploc, arg_types);
-                let is_positional = context
-                    .modules
-                    .struct_is_positional(&mident, &datatype_name);
+                let is_positional = context.info().struct_is_positional(&mident, &datatype_name);
                 let names = fringe_binders
                     .iter()
                     .map(|(name, _, _)| name.to_string())
@@ -426,7 +424,7 @@ fn find_counterexample_impl(
             }
         } else {
             let mut unmatched_variants = context
-                .modules
+                .info()
                 .enum_variants(&mident, &datatype_name)
                 .into_iter()
                 .collect::<BTreeSet<_>>();
@@ -439,14 +437,14 @@ fn find_counterexample_impl(
                 for (ctor, (ploc, arg_types)) in ctors {
                     let ctor_arity = arg_types.len() as u32;
                     let decl_fields = context
-                        .modules
+                        .info()
                         .enum_variant_fields(&mident, &datatype_name, &ctor)
                         .unwrap();
                     let fringe_binders =
                         context.make_imm_ref_match_binders(decl_fields, ploc, arg_types);
                     let is_positional =
                         context
-                            .modules
+                            .info()
                             .enum_variant_is_positional(&mident, &datatype_name, &ctor);
                     let names = fringe_binders
                         .iter()
@@ -491,13 +489,13 @@ fn find_counterexample_impl(
                         Some(result)
                     } else {
                         let variant_name = unmatched_variants.first().unwrap();
-                        let is_positional = context.modules.enum_variant_is_positional(
+                        let is_positional = context.info().enum_variant_is_positional(
                             &mident,
                             &datatype_name,
                             variant_name,
                         );
                         let ctor_args = context
-                            .modules
+                            .info()
                             .enum_variant_fields(&mident, &datatype_name, variant_name)
                             .unwrap();
                         let names = ctor_args
@@ -532,7 +530,7 @@ fn find_counterexample_impl(
         arity: u32,
         ndx: &mut u32,
     ) -> Option<Vec<CounterExample>> {
-        debug_print!(context.debug.match_counterexample, ("checking matrix" => matrix; verbose));
+        debug_print!(context.debug().match_counterexample, ("checking matrix" => matrix; verbose));
         let result = if matrix.patterns_empty() {
             None
         } else if let Some(ty) = matrix.tys.first() {
@@ -563,15 +561,15 @@ fn find_counterexample_impl(
             Some(make_wildcards(arity as usize))
         } else {
             // An error case: no entry on the fringe but no
-            if !context.env.has_errors() {
-                context.env.add_diag(ice!((
+            if !context.env().has_errors() {
+                context.add_diag(ice!((
                     matrix.loc,
                     "Non-empty matrix with non errors but no type"
                 )));
             }
             None
         };
-        debug_print!(context.debug.match_counterexample, (opt "result" => &result; sdbg));
+        debug_print!(context.debug().match_counterexample, (opt "result" => &result; sdbg));
         result
     }
 
@@ -579,7 +577,7 @@ fn find_counterexample_impl(
 
     if let Some(mut counterexample) = counterexample_rec(context, matrix, 1, &mut ndx) {
         debug_print!(
-            context.debug.match_counterexample,
+            context.debug().match_counterexample,
             ("counterexamples #" => counterexample.len(); fmt),
             (lines "counterexamples" => &counterexample; fmt)
         );
@@ -593,7 +591,7 @@ fn find_counterexample_impl(
         if has_guards {
             diag.add_note("Match arms with guards are not considered for coverage.");
         }
-        context.env.add_diag(diag);
+        context.add_diag(diag);
         true
     } else {
         false
@@ -622,9 +620,7 @@ fn ide_report_missing_arms(context: &mut Context, loc: Loc, matrix: &PatternMatr
         if !unused.is_empty() {
             let arms = unused.into_iter().map(PS::Value).collect::<Vec<_>>();
             let info = MissingMatchArmsInfo { arms };
-            context
-                .env
-                .add_ide_annotation(loc, IDEAnnotation::MissingMatchArms(Box::new(info)));
+            context.add_ide_annotation(loc, IDEAnnotation::MissingMatchArms(Box::new(info)));
         }
     }
 
@@ -635,9 +631,7 @@ fn ide_report_missing_arms(context: &mut Context, loc: Loc, matrix: &PatternMatr
             let info = MissingMatchArmsInfo {
                 arms: vec![PS::Wildcard],
             };
-            context
-                .env
-                .add_ide_annotation(loc, IDEAnnotation::MissingMatchArms(Box::new(info)));
+            context.add_ide_annotation(loc, IDEAnnotation::MissingMatchArms(Box::new(info)));
         }
     }
 
@@ -648,16 +642,16 @@ fn ide_report_missing_arms(context: &mut Context, loc: Loc, matrix: &PatternMatr
         mident: ModuleIdent,
         name: DatatypeName,
     ) {
-        if context.modules.is_struct(&mident, &name) {
+        if context.info().is_struct(&mident, &name) {
             if !matrix.is_empty() {
                 // If the matrix isn't empty, we _must_ have matched the struct with at least one
                 // non-guard arm (either wildcards or the struct itself), so we're fine.
                 return;
             }
             // If the matrix _is_ empty, we suggest adding an unpack.
-            let is_positional = context.modules.struct_is_positional(&mident, &name);
-            let Some(fields) = context.modules.struct_fields(&mident, &name) else {
-                context.env.add_diag(ice!((
+            let is_positional = context.info().struct_is_positional(&mident, &name);
+            let Some(fields) = context.info().struct_fields(&mident, &name) else {
+                context.add_diag(ice!((
                     loc,
                     "Tried to look up fields for this struct and found none"
                 )));
@@ -684,9 +678,7 @@ fn ide_report_missing_arms(context: &mut Context, loc: Loc, matrix: &PatternMatr
             let info = MissingMatchArmsInfo {
                 arms: vec![suggestion],
             };
-            context
-                .env
-                .add_ide_annotation(loc, IDEAnnotation::MissingMatchArms(Box::new(info)));
+            context.add_ide_annotation(loc, IDEAnnotation::MissingMatchArms(Box::new(info)));
         } else {
             // If there's a default arm, no suggestion is necessary.
             if matrix.has_default_arm() {
@@ -694,7 +686,7 @@ fn ide_report_missing_arms(context: &mut Context, loc: Loc, matrix: &PatternMatr
             }
 
             let mut unmatched_variants = context
-                .modules
+                .info()
                 .enum_variants(&mident, &name)
                 .into_iter()
                 .collect::<BTreeSet<_>>();
@@ -708,21 +700,19 @@ fn ide_report_missing_arms(context: &mut Context, loc: Loc, matrix: &PatternMatr
             }
             let mut arms = vec![];
             // re-iterate the original so we generate these in definition order
-            for variant in context.modules.enum_variants(&mident, &name).into_iter() {
+            for variant in context.info().enum_variants(&mident, &name).into_iter() {
                 if !unmatched_variants.contains(&variant) {
                     continue;
                 }
                 let is_empty = context
-                    .modules
+                    .info()
                     .enum_variant_is_empty(&mident, &name, &variant);
                 let is_positional = context
-                    .modules
+                    .info()
                     .enum_variant_is_positional(&mident, &name, &variant);
-                let Some(fields) = context
-                    .modules
-                    .enum_variant_fields(&mident, &name, &variant)
+                let Some(fields) = context.info().enum_variant_fields(&mident, &name, &variant)
                 else {
-                    context.env.add_diag(ice!((
+                    context.add_diag(ice!((
                         loc,
                         "Tried to look up fields for this enum and found none"
                     )));
@@ -752,14 +742,12 @@ fn ide_report_missing_arms(context: &mut Context, loc: Loc, matrix: &PatternMatr
                 arms.push(suggestion);
             }
             let info = MissingMatchArmsInfo { arms };
-            context
-                .env
-                .add_ide_annotation(loc, IDEAnnotation::MissingMatchArms(Box::new(info)));
+            context.add_ide_annotation(loc, IDEAnnotation::MissingMatchArms(Box::new(info)));
         }
     }
 
     let Some(ty) = matrix.tys.first() else {
-        context.env.add_diag(ice!((
+        context.add_diag(ice!((
             loc,
             "Pattern matrix with no types handed to IDE function"
         )));
@@ -776,9 +764,9 @@ fn ide_report_missing_arms(context: &mut Context, loc: Loc, matrix: &PatternMatr
     {
         report_datatype(context, loc, matrix, mident, datatype_name)
     } else {
-        if !context.env.has_errors() {
+        if !context.env().has_errors() {
             // It's unclear how we got here, so report an ICE and suggest a wildcard.
-            context.env.add_diag(ice!((
+            context.add_diag(ice!((
                 loc,
                 format!(
                     "Found non-matchable type {} as match subject",
@@ -790,9 +778,7 @@ fn ide_report_missing_arms(context: &mut Context, loc: Loc, matrix: &PatternMatr
             let info = MissingMatchArmsInfo {
                 arms: vec![PS::Wildcard],
             };
-            context
-                .env
-                .add_ide_annotation(loc, IDEAnnotation::MissingMatchArms(Box::new(info)));
+            context.add_ide_annotation(loc, IDEAnnotation::MissingMatchArms(Box::new(info)));
         }
     }
 }

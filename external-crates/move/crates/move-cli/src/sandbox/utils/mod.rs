@@ -159,17 +159,14 @@ pub(crate) fn explain_publish_error(
             println!("Breaking change detected--publishing aborted. Re-run with --ignore-breaking-changes to publish anyway.");
 
             let old_module = state.get_module_by_id(&module_id)?.unwrap();
-            let old_api = normalized::Module::new(&old_module);
-            let new_api = normalized::Module::new(module);
+            let pool = &mut normalized::RcPool::new();
+            let old_api = normalized::Module::new(pool, &old_module, /* include code */ true);
+            let new_api = normalized::Module::new(pool, module, /* include code */ true);
 
             if (Compatibility {
-                check_datatype_and_pub_function_linking: false,
                 check_datatype_layout: true,
-                check_friend_linking: false,
                 check_private_entry_linking: true,
                 disallowed_new_abilities: AbilitySet::EMPTY,
-                disallow_change_datatype_type_params: false,
-                disallow_new_variants: false,
             })
             .check(&old_api, &new_api)
             .is_err()
@@ -178,13 +175,9 @@ pub(crate) fn explain_publish_error(
                 // structs of this type. but probably a bad idea
                 println!("Layout API for structs of module {} has changed. Need to do a data migration of published structs", module_id)
             } else if (Compatibility {
-                check_datatype_and_pub_function_linking: true,
                 check_datatype_layout: false,
-                check_friend_linking: false,
                 check_private_entry_linking: true,
                 disallowed_new_abilities: AbilitySet::EMPTY,
-                disallow_change_datatype_type_params: false,
-                disallow_new_variants: false,
             })
             .check(&old_api, &new_api)
             .is_err()
@@ -365,7 +358,7 @@ pub(crate) fn explain_execution_error(
 /// Return `true` if `path` is a Move bytecode file based on its extension
 pub(crate) fn is_bytecode_file(path: &Path) -> bool {
     path.extension()
-        .map_or(false, |ext| ext == MOVE_COMPILED_EXTENSION)
+        .is_some_and(|ext| ext == MOVE_COMPILED_EXTENSION)
 }
 
 /// Return `true` if path contains a valid Move bytecode module

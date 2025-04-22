@@ -11,7 +11,7 @@ use sui_types::{
     base_types::{AuthorityName, ObjectID, SequenceNumber, SuiAddress},
     committee::{Committee, EpochId},
     crypto::{AccountKeyPair, AuthorityKeyPair},
-    digests::{ObjectDigest, TransactionDigest, TransactionEventsDigest},
+    digests::{ObjectDigest, TransactionDigest},
     effects::{TransactionEffects, TransactionEffectsAPI, TransactionEvents},
     error::SuiError,
     messages_checkpoint::{
@@ -35,9 +35,7 @@ pub struct InMemoryStore {
     // Transaction data
     transactions: HashMap<TransactionDigest, VerifiedTransaction>,
     effects: HashMap<TransactionDigest, TransactionEffects>,
-    events: HashMap<TransactionEventsDigest, TransactionEvents>,
-    // Map from transaction digest to events digest for easy lookup
-    events_tx_digest_index: HashMap<TransactionDigest, TransactionEventsDigest>,
+    events: HashMap<TransactionDigest, TransactionEvents>,
 
     // Committee data
     epoch_to_committee: Vec<Committee>,
@@ -97,10 +95,7 @@ impl InMemoryStore {
         self.effects.get(digest)
     }
 
-    pub fn get_transaction_events(
-        &self,
-        digest: &TransactionEventsDigest,
-    ) -> Option<&TransactionEvents> {
+    pub fn get_transaction_events(&self, digest: &TransactionDigest) -> Option<&TransactionEvents> {
         self.events.get(digest)
     }
 
@@ -198,9 +193,7 @@ impl InMemoryStore {
     }
 
     pub fn insert_events(&mut self, tx_digest: &TransactionDigest, events: TransactionEvents) {
-        self.events_tx_digest_index
-            .insert(*tx_digest, events.digest());
-        self.events.insert(events.digest(), events);
+        self.events.insert(*tx_digest, events);
     }
 
     pub fn update_objects(
@@ -249,7 +242,7 @@ impl ChildObjectResolver for InMemoryStore {
             return Err(SuiError::InvalidChildObjectAccess {
                 object: *child,
                 given_parent: parent,
-                actual_owner: child_object.owner,
+                actual_owner: child_object.owner.clone(),
             });
         }
 
@@ -306,19 +299,16 @@ impl ModuleResolver for InMemoryStore {
 }
 
 impl ObjectStore for InMemoryStore {
-    fn get_object(
-        &self,
-        object_id: &ObjectID,
-    ) -> Result<Option<Object>, sui_types::storage::error::Error> {
-        Ok(self.get_object(object_id).cloned())
+    fn get_object(&self, object_id: &ObjectID) -> Option<Object> {
+        self.get_object(object_id).cloned()
     }
 
     fn get_object_by_key(
         &self,
         object_id: &ObjectID,
         version: sui_types::base_types::VersionNumber,
-    ) -> Result<Option<Object>, sui_types::storage::error::Error> {
-        Ok(self.get_object_at_version(object_id, version).cloned())
+    ) -> Option<Object> {
+        self.get_object_at_version(object_id, version).cloned()
     }
 }
 
@@ -326,7 +316,7 @@ impl ParentSync for InMemoryStore {
     fn get_latest_parent_entry_ref_deprecated(
         &self,
         _object_id: ObjectID,
-    ) -> sui_types::error::SuiResult<Option<sui_types::base_types::ObjectRef>> {
+    ) -> Option<sui_types::base_types::ObjectRef> {
         panic!("Never called in newer protocol versions")
     }
 }
@@ -411,21 +401,8 @@ impl SimulatorStore for InMemoryStore {
         self.get_transaction_effects(digest).cloned()
     }
 
-    fn get_transaction_events(
-        &self,
-        digest: &TransactionEventsDigest,
-    ) -> Option<TransactionEvents> {
+    fn get_transaction_events(&self, digest: &TransactionDigest) -> Option<TransactionEvents> {
         self.get_transaction_events(digest).cloned()
-    }
-
-    fn get_transaction_events_by_tx_digest(
-        &self,
-        tx_digest: &TransactionDigest,
-    ) -> Option<TransactionEvents> {
-        self.events_tx_digest_index
-            .get(tx_digest)
-            .and_then(|x| self.events.get(x))
-            .cloned()
     }
 
     fn get_object(&self, id: &ObjectID) -> Option<Object> {

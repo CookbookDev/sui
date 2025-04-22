@@ -6,7 +6,6 @@ use parking_lot::Mutex;
 use parking_lot::MutexGuard;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
-use std::error::Error;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::mem;
@@ -118,14 +117,10 @@ impl<K: Eq + Hash + Clone, V: Clone> NotifyRead<K, V> {
 }
 
 impl<K: Eq + Hash + Clone + Unpin, V: Clone + Unpin> NotifyRead<K, V> {
-    pub async fn read<E: Error>(
-        &self,
-        keys: &[K],
-        fetch: impl FnOnce(&[K]) -> Result<Vec<Option<V>>, E>,
-    ) -> Result<Vec<V>, E> {
+    pub async fn read(&self, keys: &[K], fetch: impl FnOnce(&[K]) -> Vec<Option<V>>) -> Vec<V> {
         let registrations = self.register_all(keys);
 
-        let results = fetch(keys)?;
+        let results = fetch(keys);
 
         let results = results
             .into_iter()
@@ -136,7 +131,7 @@ impl<K: Eq + Hash + Clone + Unpin, V: Clone + Unpin> NotifyRead<K, V> {
                 None => Either::Right(r),
             });
 
-        Ok(join_all(results).await)
+        join_all(results).await
     }
 }
 
@@ -147,7 +142,7 @@ pub struct Registration<'a, K: Eq + Hash + Clone, V: Clone> {
     registration: Option<(K, oneshot::Receiver<V>)>,
 }
 
-impl<'a, K: Eq + Hash + Clone + Unpin, V: Clone + Unpin> Future for Registration<'a, K, V> {
+impl<K: Eq + Hash + Clone + Unpin, V: Clone + Unpin> Future for Registration<'_, K, V> {
     type Output = V;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -165,7 +160,7 @@ impl<'a, K: Eq + Hash + Clone + Unpin, V: Clone + Unpin> Future for Registration
     }
 }
 
-impl<'a, K: Eq + Hash + Clone, V: Clone> Drop for Registration<'a, K, V> {
+impl<K: Eq + Hash + Clone, V: Clone> Drop for Registration<'_, K, V> {
     fn drop(&mut self) {
         if let Some((key, receiver)) = self.registration.take() {
             mem::drop(receiver);

@@ -67,7 +67,6 @@ use sui_types::messages_grpc::{
 
 use sui_types::storage::{ReadStore, SharedInMemoryStore};
 use tracing::info;
-use typed_store::rocks::MetricConf;
 
 pub mod commands;
 pub mod db_tool;
@@ -105,9 +104,16 @@ async fn make_clients(
         .active_validators;
 
     for validator in active_validators {
-        let net_addr = Multiaddr::try_from(validator.net_address).unwrap();
+        let net_addr = Multiaddr::try_from(validator.net_address)
+            .unwrap()
+            .rewrite_http_to_https();
+        let tls_config = sui_tls::create_rustls_client_config(
+            sui_types::crypto::NetworkPublicKey::from_bytes(&validator.network_pubkey_bytes)?,
+            sui_tls::SUI_VALIDATOR_SERVER_NAME.to_string(),
+            None,
+        );
         let channel = net_config
-            .connect_lazy(&net_addr)
+            .connect_lazy(&net_addr, Some(tls_config))
             .map_err(|err| anyhow!(err.to_string()))?;
         let client = NetworkAuthorityClient::new(channel);
         let public_key_bytes =
@@ -180,7 +186,7 @@ impl GroupedObjectOutput {
                 Ok(r) => {
                     let obj_digest = r.object.compute_object_reference().2;
                     let parent_tx_digest = r.object.previous_transaction;
-                    let owner = r.object.owner;
+                    let owner = r.object.owner.clone();
                     let lock = r.lock_for_debugging.as_ref().map(|lock| *lock.digest());
                     if lock.is_none() {
                         available_voting_power += stake;
@@ -189,7 +195,7 @@ impl GroupedObjectOutput {
                 }
                 Err(_) => None,
             };
-            let entry = grouped_results.entry(key).or_insert_with(Vec::new);
+            let entry = grouped_results.entry(key.clone()).or_insert_with(Vec::new);
             entry.push(*name);
             let entry: &mut u64 = voting_power.entry(key).or_default();
             *entry += stake;
@@ -275,7 +281,7 @@ impl std::fmt::Display for ConciseObjectOutput {
                 Ok(resp) => {
                     let obj_digest = resp.object.compute_object_reference().2;
                     let parent = resp.object.previous_transaction;
-                    let owner = resp.object.owner;
+                    let owner = resp.object.owner.clone();
                     write!(f, " {:<66} {:<45} {:<51}", obj_digest, parent, owner)?;
                 }
             }
@@ -498,8 +504,8 @@ pub(crate) fn make_anemo_config() -> anemo_cli::Config {
         .add_service(
             "Discovery",
             anemo_cli::ServiceInfo::new().add_method(
-                "GetKnownPeers",
-                anemo_cli::ron_method!(DiscoveryClient, get_known_peers, ()),
+                "GetKnownPeersV2",
+                anemo_cli::ron_method!(DiscoveryClient, get_known_peers_v2, ()),
             ),
         )
         // Sui state sync
@@ -584,8 +590,7 @@ fn start_summary_sync(
 ) -> JoinHandle<Result<(), anyhow::Error>> {
     tokio::spawn(async move {
         info!("Starting summary sync");
-        let store =
-            AuthorityStore::open_no_genesis(perpetual_db, usize::MAX, false, &Registry::default())?;
+        let store = AuthorityStore::open_no_genesis(perpetual_db, false, &Registry::default())?;
         let cache_traits = build_execution_cache_from_env(&Registry::default(), &store);
         let state_sync_store =
             RocksDbStore::new(cache_traits, committee_store, checkpoint_store.clone());
@@ -743,12 +748,9 @@ fn start_summary_sync(
                     let epoch_last_checkpoint = checkpoint_store
                         .get_checkpoint_by_sequence_number(*epoch_last_cp_seq_num)?
                         .ok_or(anyhow!("Failed to read checkpoint"))?;
-                    let committee = state_sync_store
-                        .get_committee(cp_epoch as u64)
-                        .expect("store operation should not fail")
-                        .expect(
-                            "Expected committee to exist after syncing all end of epoch checkpoints",
-                        );
+                    let committee = state_sync_store.get_committee(cp_epoch as u64).expect(
+                        "Expected committee to exist after syncing all end of epoch checkpoints",
+                    );
                     epoch_last_checkpoint
                         .verify_authority_signatures(&committee)
                         .expect("Failed to verify checkpoint");
@@ -842,12 +844,7 @@ pub async fn download_formal_snapshot(
         &genesis_committee,
         None,
     ));
-    let checkpoint_store = Arc::new(CheckpointStore::open_tables_read_write(
-        path.join("checkpoints"),
-        MetricConf::default(),
-        None,
-        None,
-    ));
+    let checkpoint_store = CheckpointStore::new(&path.join("checkpoints"));
 
     let summaries_handle = start_summary_sync(
         perpetual_db.clone(),
@@ -884,9 +881,9 @@ pub async fn download_formal_snapshot(
             epoch,
             &snapshot_store_config,
             &local_store_config,
-            usize::MAX,
             NonZeroUsize::new(num_parallel_downloads).unwrap(),
             m_clone,
+            false, // skip_reset_local_store
         )
         .await
         .unwrap_or_else(|err| panic!("Failed to create reader: {}", err));
@@ -1155,7 +1152,7 @@ pub async fn dump_checkpoints_from_archive(
     {
         let mut content = serde_json::to_string(
             &store
-                .get_full_checkpoint_contents_by_sequence_number(key.sequence_number)?
+                .get_full_checkpoint_contents(Some(key.sequence_number), &key.content_digest)
                 .unwrap(),
         )?;
         content.truncate(max_content_length);

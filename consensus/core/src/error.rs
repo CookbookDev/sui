@@ -71,9 +71,6 @@ pub(crate) enum ConsensusError {
     #[error("Too many blocks have been returned from authority {0} when requesting to fetch missing blocks")]
     TooManyFetchedBlocksReturned(AuthorityIndex),
 
-    #[error("Too many blocks have been requested from authority {0}")]
-    TooManyFetchBlocksRequested(AuthorityIndex),
-
     #[error("Too many authorities have been provided from authority {0}")]
     TooManyAuthoritiesProvided(AuthorityIndex),
 
@@ -126,9 +123,6 @@ pub(crate) enum ConsensusError {
         block_timestamp_ms: u64,
     },
 
-    #[error("No available authority to fetch commits")]
-    NoAvailableAuthorityToFetchCommits,
-
     #[error("Received no commit from peer {peer}")]
     NoCommitReceived { peer: AuthorityIndex },
 
@@ -164,6 +158,14 @@ pub(crate) enum ConsensusError {
         received: BlockRef,
     },
 
+    #[error(
+        "Unexpected certified commit index and last committed index. Expected next commit index to be {expected_commit_index}, but found {commit_index}"
+    )]
+    UnexpectedCertifiedCommitIndex {
+        expected_commit_index: CommitIndex,
+        commit_index: CommitIndex,
+    },
+
     #[error("RocksDB failure: {0}")]
     RocksDBFailure(#[from] TypedStoreError),
 
@@ -179,9 +181,6 @@ pub(crate) enum ConsensusError {
     #[error("Failed to connect as client: {0:?}")]
     NetworkClientConnection(String),
 
-    #[error("Failed to connect as server: {0:?}")]
-    NetworkServerConnection(String),
-
     #[error("Failed to send request: {0:?}")]
     NetworkRequest(String),
 
@@ -190,6 +189,13 @@ pub(crate) enum ConsensusError {
 
     #[error("Consensus has shut down!")]
     Shutdown,
+}
+
+impl ConsensusError {
+    /// Returns the error name - only the enun name without any parameters - as a static string.
+    pub fn name(&self) -> &'static str {
+        self.into()
+    }
 }
 
 pub type ConsensusResult<T> = Result<T, ConsensusError>;
@@ -208,4 +214,40 @@ macro_rules! ensure {
             bail!($e);
         }
     };
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// This test ensures that consensus errors when converted to a static string are the same as the enum name without
+    /// any parameterers included to the result string.
+    #[test]
+    fn test_error_name() {
+        {
+            let error = ConsensusError::InvalidAncestorRound {
+                ancestor: 10,
+                block: 11,
+            };
+            let error: &'static str = error.into();
+
+            assert_eq!(error, "InvalidAncestorRound");
+        }
+
+        {
+            let error = ConsensusError::InvalidAuthorityIndex {
+                index: AuthorityIndex::new_for_test(3),
+                max: 10,
+            };
+            assert_eq!(error.name(), "InvalidAuthorityIndex");
+        }
+
+        {
+            let error = ConsensusError::InsufficientParentStakes {
+                parent_stakes: 5,
+                quorum: 20,
+            };
+            assert_eq!(error.name(), "InsufficientParentStakes");
+        }
+    }
 }

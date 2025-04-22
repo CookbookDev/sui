@@ -19,13 +19,16 @@ use move_ir_types::{
 };
 use move_symbol_pool::Symbol;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, ops::Bound};
+use std::{collections::BTreeMap, ops::Bound, path::PathBuf};
 
 //***************************************************************************
 // Source location mapping
 //***************************************************************************
 
 pub type SourceName = (String, Loc);
+
+/// The current version of the trace format.
+const CURRENT_VERSION: u64 = 2;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StructSourceMap {
@@ -58,6 +61,10 @@ pub struct FunctionSourceMap {
     /// The source location for the definition of this entire function. Note that in certain
     /// instances this will have no valid source location e.g. the "main" function for modules that
     /// are treated as programs are synthesized and therefore have no valid source location.
+    pub location: Loc,
+    /// The source location for the name under which this functin is defined. Note that in certain
+    /// instances this will have no valid source location e.g. the "main" function for modules that
+    /// are treated as programs are synthesized and therefore have no valid source location.
     pub definition_location: Loc,
 
     /// The names of the type parameters to the function.
@@ -66,6 +73,9 @@ pub struct FunctionSourceMap {
 
     /// The names of the parameters to the function.
     pub parameters: Vec<SourceName>,
+
+    /// The locations of the return values
+    pub returns: Vec<Loc>,
 
     /// The index into the vector is the local's index. The corresponding `(Identifier, Location)` tuple
     /// is the name and location of the local.
@@ -84,6 +94,12 @@ pub struct FunctionSourceMap {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SourceMap {
+    /// Version of the source map format
+    pub version: u64,
+
+    /// A path to source file used to generate this source map.
+    pub from_file_path: Option<PathBuf>,
+
     /// The source location for the definition of the module or script that this source map is for.
     pub definition_location: Loc,
 
@@ -201,11 +217,13 @@ impl EnumSourceMap {
 }
 
 impl FunctionSourceMap {
-    pub fn new(definition_location: Loc, is_native: bool) -> Self {
+    pub fn new(location: Loc, definition_location: Loc, is_native: bool) -> Self {
         Self {
+            location,
             definition_location,
             type_parameters: Vec::new(),
             parameters: Vec::new(),
+            returns: Vec::new(),
             locals: Vec::new(),
             code_map: BTreeMap::new(),
             is_native,
@@ -252,6 +270,10 @@ impl FunctionSourceMap {
         self.parameters.push(name)
     }
 
+    /// add the locations of return values
+    pub fn add_return_mapping(&mut self, loc: Loc) {
+        self.returns.push(loc);
+    }
     /// Recall that we are using a segment tree. We therefore lookup the location for the code
     /// offset by performing a range query for the largest number less than or equal to the code
     /// offset passed in.
@@ -335,6 +357,8 @@ impl SourceMap {
             (module_name.address, ident)
         };
         Self {
+            from_file_path: None,
+            version: CURRENT_VERSION,
             definition_location,
             module_name,
             struct_map: BTreeMap::new(),
@@ -353,9 +377,10 @@ impl SourceMap {
         &mut self,
         fdef_idx: FunctionDefinitionIndex,
         location: Loc,
+        definition_location: Loc,
         is_native: bool,
     ) -> Result<()> {
-        self.function_map.insert(fdef_idx.0, FunctionSourceMap::new(location, is_native)).map_or(Ok(()), |_| { Err(format_err!(
+        self.function_map.insert(fdef_idx.0, FunctionSourceMap::new(location, definition_location, is_native)).map_or(Ok(()), |_| { Err(format_err!(
                     "Multiple functions at same function definition index encountered when constructing source map"
                 )) })
     }
@@ -448,6 +473,18 @@ impl SourceMap {
             format_err!("Tried to add parameter mapping to undefined function index")
         })?;
         func_entry.add_parameter_mapping(name);
+        Ok(())
+    }
+
+    pub fn add_return_mapping(
+        &mut self,
+        fdef_idx: FunctionDefinitionIndex,
+        loc: Loc,
+    ) -> Result<()> {
+        let func_entry = self.function_map.get_mut(&fdef_idx.0).ok_or_else(|| {
+            format_err!("Tried to add return mapping to undefined function index")
+        })?;
+        func_entry.add_return_mapping(loc);
         Ok(())
     }
 
@@ -636,6 +673,7 @@ impl SourceMap {
             empty_source_map.add_top_level_function_mapping(
                 FunctionDefinitionIndex(function_idx as TableIndex),
                 default_loc,
+                default_loc,
                 false,
             )?;
             let function_handle = module.function_handle_at(function_def.function);
@@ -684,5 +722,73 @@ impl SourceMap {
         }
 
         Ok(empty_source_map)
+    }
+
+    pub fn replace_file_hashes(&mut self, file_hash: FileHash) {
+        self.definition_location = Loc::new(
+            file_hash,
+            self.definition_location.start(),
+            self.definition_location.end(),
+        );
+        for (_, struct_map) in self.struct_map.iter_mut() {
+            struct_map.definition_location = Loc::new(
+                file_hash,
+                struct_map.definition_location.start(),
+                struct_map.definition_location.end(),
+            );
+            for (_, loc) in struct_map.type_parameters.iter_mut() {
+                *loc = Loc::new(file_hash, loc.start(), loc.end());
+            }
+            for loc in struct_map.fields.iter_mut() {
+                *loc = Loc::new(file_hash, loc.start(), loc.end());
+            }
+        }
+        for (_, enum_map) in self.enum_map.iter_mut() {
+            enum_map.definition_location = Loc::new(
+                file_hash,
+                enum_map.definition_location.start(),
+                enum_map.definition_location.end(),
+            );
+            for (_, loc) in enum_map.type_parameters.iter_mut() {
+                *loc = Loc::new(file_hash, loc.start(), loc.end());
+            }
+            for ((_, loc), field_locations) in enum_map.variants.iter_mut() {
+                *loc = Loc::new(file_hash, loc.start(), loc.end());
+                for field_loc in field_locations.iter_mut() {
+                    *field_loc = Loc::new(file_hash, field_loc.start(), field_loc.end());
+                }
+            }
+        }
+        for (_, function_map) in self.function_map.iter_mut() {
+            function_map.location = Loc::new(
+                file_hash,
+                function_map.location.start(),
+                function_map.location.end(),
+            );
+            function_map.definition_location = Loc::new(
+                file_hash,
+                function_map.definition_location.start(),
+                function_map.definition_location.end(),
+            );
+            for (_, loc) in function_map.type_parameters.iter_mut() {
+                *loc = Loc::new(file_hash, loc.start(), loc.end());
+            }
+            for (_, loc) in function_map.parameters.iter_mut() {
+                *loc = Loc::new(file_hash, loc.start(), loc.end());
+            }
+            for loc in function_map.returns.iter_mut() {
+                *loc = Loc::new(file_hash, loc.start(), loc.end());
+            }
+            for (_, loc) in function_map.locals.iter_mut() {
+                *loc = Loc::new(file_hash, loc.start(), loc.end());
+            }
+            for (_, loc) in function_map.code_map.iter_mut() {
+                *loc = Loc::new(file_hash, loc.start(), loc.end());
+            }
+        }
+    }
+
+    pub fn set_from_file_path(&mut self, from_file_path: PathBuf) {
+        self.from_file_path = Some(from_file_path);
     }
 }

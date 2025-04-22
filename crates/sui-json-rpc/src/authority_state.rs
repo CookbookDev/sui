@@ -1,7 +1,6 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::anyhow;
 use arc_swap::Guard;
 use async_trait::async_trait;
 use move_core_types::language_storage::TypeTag;
@@ -10,22 +9,21 @@ use std::sync::Arc;
 use sui_core::authority::authority_per_epoch_store::AuthorityPerEpochStore;
 use sui_core::authority::AuthorityState;
 use sui_core::execution_cache::ObjectCacheRead;
+use sui_core::jsonrpc_index::TotalBalance;
 use sui_core::subscription_handler::SubscriptionHandler;
 use sui_json_rpc_types::{
     Coin as SuiCoin, DevInspectResults, DryRunTransactionBlockResponse, EventFilter, SuiEvent,
     SuiObjectDataFilter, TransactionFilter,
 };
-use sui_storage::indexes::TotalBalance;
 use sui_storage::key_value_store::{
-    KVStoreCheckpointData, KVStoreTransactionData, TransactionKeyValueStore,
-    TransactionKeyValueStoreTrait,
+    KVStoreTransactionData, TransactionKeyValueStore, TransactionKeyValueStoreTrait,
 };
 use sui_types::base_types::{
     MoveObjectType, ObjectID, ObjectInfo, ObjectRef, SequenceNumber, SuiAddress,
 };
 use sui_types::bridge::Bridge;
 use sui_types::committee::{Committee, EpochId};
-use sui_types::digests::{ChainIdentifier, TransactionDigest, TransactionEventsDigest};
+use sui_types::digests::{ChainIdentifier, TransactionDigest};
 use sui_types::dynamic_field::DynamicFieldInfo;
 use sui_types::effects::TransactionEffects;
 use sui_types::error::{SuiError, UserInputError};
@@ -43,10 +41,10 @@ use sui_types::transaction::{Transaction, TransactionData, TransactionKind};
 use thiserror::Error;
 use tokio::task::JoinError;
 
+use crate::ObjectProvider;
 #[cfg(test)]
 use mockall::automock;
-
-use crate::ObjectProvider;
+use typed_store_error::TypedStoreError;
 
 pub type StateReadResult<T = ()> = Result<T, StateReadError>;
 
@@ -58,16 +56,7 @@ pub trait StateRead: Send + Sync {
         &self,
         transactions: &[TransactionDigest],
         effects: &[TransactionDigest],
-        events: &[TransactionEventsDigest],
     ) -> StateReadResult<KVStoreTransactionData>;
-
-    async fn multi_get_checkpoints(
-        &self,
-        checkpoint_summaries: &[CheckpointSequenceNumber],
-        checkpoint_contents: &[CheckpointSequenceNumber],
-        checkpoint_summaries_by_digest: &[CheckpointDigest],
-        checkpoint_contents_by_digest: &[CheckpointContentsDigest],
-    ) -> StateReadResult<KVStoreCheckpointData>;
 
     fn get_object_read(&self, object_id: &ObjectID) -> StateReadResult<ObjectRead>;
 
@@ -176,7 +165,7 @@ pub trait StateRead: Send + Sync {
     fn get_owned_coins(
         &self,
         owner: SuiAddress,
-        cursor: (String, ObjectID),
+        cursor: (String, u64, ObjectID),
         limit: usize,
         one_coin_type_only: bool,
     ) -> StateReadResult<Vec<SuiCoin>>;
@@ -244,33 +233,12 @@ impl StateRead for AuthorityState {
         &self,
         transactions: &[TransactionDigest],
         effects: &[TransactionDigest],
-        events: &[TransactionEventsDigest],
     ) -> StateReadResult<KVStoreTransactionData> {
         Ok(
             <AuthorityState as TransactionKeyValueStoreTrait>::multi_get(
                 self,
                 transactions,
                 effects,
-                events,
-            )
-            .await?,
-        )
-    }
-
-    async fn multi_get_checkpoints(
-        &self,
-        checkpoint_summaries: &[CheckpointSequenceNumber],
-        checkpoint_contents: &[CheckpointSequenceNumber],
-        checkpoint_summaries_by_digest: &[CheckpointDigest],
-        checkpoint_contents_by_digest: &[CheckpointContentsDigest],
-    ) -> StateReadResult<KVStoreCheckpointData> {
-        Ok(
-            <AuthorityState as TransactionKeyValueStoreTrait>::multi_get_checkpoints(
-                self,
-                checkpoint_summaries,
-                checkpoint_contents,
-                checkpoint_summaries_by_digest,
-                checkpoint_contents_by_digest,
             )
             .await?,
         )
@@ -281,7 +249,7 @@ impl StateRead for AuthorityState {
     }
 
     async fn get_object(&self, object_id: &ObjectID) -> StateReadResult<Option<Object>> {
-        Ok(self.get_object(object_id).await?)
+        Ok(self.get_object(object_id).await)
     }
 
     fn get_past_object_read(
@@ -448,21 +416,21 @@ impl StateRead for AuthorityState {
     fn get_owned_coins(
         &self,
         owner: SuiAddress,
-        cursor: (String, ObjectID),
+        cursor: (String, u64, ObjectID),
         limit: usize,
         one_coin_type_only: bool,
     ) -> StateReadResult<Vec<SuiCoin>> {
         Ok(self
             .get_owned_coins_iterator_with_cursor(owner, cursor, limit, one_coin_type_only)?
-            .map(|(coin_type, coin_object_id, coin)| SuiCoin {
-                coin_type,
-                coin_object_id,
+            .map(|(key, coin)| SuiCoin {
+                coin_type: key.coin_type,
+                coin_object_id: key.object_id,
                 version: coin.version,
                 digest: coin.digest,
                 balance: coin.balance,
                 previous_transaction: coin.previous_transaction,
             })
-            .collect::<Vec<_>>())
+            .collect())
     }
 
     async fn get_executed_transaction_and_effects(
@@ -480,24 +448,30 @@ impl StateRead for AuthorityState {
         owner: SuiAddress,
         coin_type: TypeTag,
     ) -> StateReadResult<TotalBalance> {
-        Ok(self
-            .indexes
-            .as_ref()
-            .ok_or(SuiError::IndexStoreNotAvailable)?
-            .get_balance(owner, coin_type)
-            .await?)
+        let indexes = self.indexes.clone();
+        Ok(tokio::task::spawn_blocking(move || {
+            indexes
+                .as_ref()
+                .ok_or(SuiError::IndexStoreNotAvailable)?
+                .get_balance(owner, coin_type)
+        })
+        .await
+        .map_err(|e: JoinError| SuiError::ExecutionError(e.to_string()))??)
     }
 
     async fn get_all_balance(
         &self,
         owner: SuiAddress,
     ) -> StateReadResult<Arc<HashMap<TypeTag, TotalBalance>>> {
-        Ok(self
-            .indexes
-            .as_ref()
-            .ok_or(SuiError::IndexStoreNotAvailable)?
-            .get_all_balance(owner)
-            .await?)
+        let indexes = self.indexes.clone();
+        Ok(tokio::task::spawn_blocking(move || {
+            indexes
+                .as_ref()
+                .ok_or(SuiError::IndexStoreNotAvailable)?
+                .get_all_balance(owner)
+        })
+        .await
+        .map_err(|e: JoinError| SuiError::ExecutionError(e.to_string()))??)
     }
 
     fn get_verified_checkpoint_by_sequence_number(
@@ -527,7 +501,7 @@ impl StateRead for AuthorityState {
     ) -> StateReadResult<Vec<Option<(EpochId, CheckpointSequenceNumber)>>> {
         Ok(self
             .get_checkpoint_cache()
-            .deprecated_multi_get_transaction_checkpoint(digests)?)
+            .deprecated_multi_get_transaction_checkpoint(digests))
     }
 
     fn deprecated_get_transaction_checkpoint(
@@ -536,7 +510,7 @@ impl StateRead for AuthorityState {
     ) -> StateReadResult<Option<(EpochId, CheckpointSequenceNumber)>> {
         Ok(self
             .get_checkpoint_cache()
-            .deprecated_get_transaction_checkpoint(digest)?)
+            .deprecated_get_transaction_checkpoint(digest))
     }
 
     fn multi_get_checkpoint_by_sequence_number(
@@ -562,9 +536,7 @@ impl StateRead for AuthorityState {
     }
 
     fn get_chain_identifier(&self) -> StateReadResult<ChainIdentifier> {
-        Ok(self
-            .get_chain_identifier()
-            .ok_or(anyhow!("Chain identifier not found"))?)
+        Ok(self.get_chain_identifier())
     }
 }
 
@@ -589,7 +561,7 @@ impl<S: ?Sized + StateRead> ObjectProvider for Arc<S> {
     ) -> Result<Option<Object>, Self::Error> {
         Ok(self
             .get_cache_reader()
-            .find_object_lt_or_eq_version(*id, *version)?)
+            .find_object_lt_or_eq_version(*id, *version))
     }
 }
 
@@ -622,7 +594,7 @@ impl<S: ?Sized + StateRead> ObjectProvider for (Arc<S>, Arc<TransactionKeyValueS
         Ok(self
             .0
             .get_cache_reader()
-            .find_object_lt_or_eq_version(*id, *version)?)
+            .find_object_lt_or_eq_version(*id, *version))
     }
 }
 
@@ -687,5 +659,12 @@ impl From<JoinError> for StateReadError {
 impl From<anyhow::Error> for StateReadError {
     fn from(e: anyhow::Error) -> Self {
         StateReadError::Internal(e.into())
+    }
+}
+
+impl From<TypedStoreError> for StateReadError {
+    fn from(e: TypedStoreError) -> Self {
+        let error: SuiError = e.into();
+        StateReadError::Internal(error.into())
     }
 }

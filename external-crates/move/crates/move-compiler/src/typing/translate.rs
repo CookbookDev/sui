@@ -7,23 +7,23 @@ use crate::{
     diagnostics::{codes::*, Diagnostic},
     editions::{FeatureGate, Flavor},
     expansion::ast::{
-        AbilitySet, Attribute, AttributeValue_, Attribute_, DottedUsage, Fields, Friend,
-        ModuleAccess_, ModuleIdent, ModuleIdent_, Mutability, TargetKind, Value_, Visibility,
+        AbilitySet, Attribute, AttributeName_, AttributeValue_, Attribute_, DottedUsage, Fields,
+        Friend, ModuleAccess_, ModuleIdent, ModuleIdent_, Mutability, Value_, Visibility,
     },
-    ice,
+    ice, ice_assert,
     naming::ast::{
-        self as N, BlockLabel, DatatypeTypeParameter, IndexSyntaxMethods, TParam, TParamID, Type,
-        TypeName, TypeName_, Type_,
+        self as N, BlockLabel, DatatypeTypeParameter, IndexSyntaxMethods, ResolvedUseFuns, TParam,
+        TParamID, Type, TypeName, TypeName_, Type_,
     },
     parser::ast::{
-        Ability_, BinOp, BinOp_, ConstantName, DatatypeName, Field, FunctionName, UnaryOp_,
-        VariantName,
+        Ability_, BinOp, BinOp_, ConstantName, DatatypeName, DocComment, Field, FunctionName,
+        TargetKind, UnaryOp_, VariantName,
     },
     shared::{
         ide::{DotAutocompleteInfo, IDEAnnotation, MacroCallInfo},
-        known_attributes::{SyntaxAttribute, TestingAttribute},
+        known_attributes::{ErrorAttribute, SyntaxAttribute, TestingAttribute},
         process_binops,
-        program_info::{ConstantInfo, DatatypeKind, TypingProgramInfo},
+        program_info::{ConstantInfo, DatatypeKind, NamingProgramInfo, TypingProgramInfo},
         string_utils::{debug_print, make_ascii_titlecase},
         unique_map::UniqueMap,
         *,
@@ -32,8 +32,8 @@ use crate::{
     typing::{
         ast::{self as T},
         core::{
-            self, public_testing_visibility, report_visibility_error, Context, PublicForTesting,
-            ResolvedFunctionType, Subst,
+            self, global_use_funs, public_testing_visibility, report_visibility_error, Context,
+            ModuleContext, PublicForTesting, ResolvedFunctionType, Subst,
         },
         dependency_ordering, expand, infinite_instantiations, macro_expand, match_analysis,
         recursive_datatypes,
@@ -43,9 +43,11 @@ use crate::{
 };
 use move_ir_types::location::*;
 use move_proc_macros::growing_stack;
+use move_symbol_pool::Symbol;
+use rayon::prelude::*;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 //**************************************************************************************************
@@ -53,51 +55,47 @@ use std::{
 //**************************************************************************************************
 
 pub fn program(
-    compilation_env: &mut CompilationEnv,
+    compilation_env: &CompilationEnv,
     pre_compiled_lib: Option<Arc<FullyCompiledProgram>>,
     prog: N::Program,
 ) -> T::Program {
     let N::Program {
-        info,
+        mut info,
+        warning_filters_table,
         inner: N::Program_ { modules: nmodules },
     } = prog;
-    let mut context = Box::new(Context::new(
-        compilation_env,
-        pre_compiled_lib.clone(),
-        info,
-    ));
 
-    extract_macros(&mut context, &nmodules, &pre_compiled_lib);
-    let mut modules = modules(&mut context, nmodules);
+    let all_macro_definitions = extract_macros(&nmodules, &pre_compiled_lib);
+    let mut modules = modules(compilation_env, &mut info, &all_macro_definitions, nmodules);
 
-    assert!(context.constraints.is_empty());
-    dependency_ordering::program(context.env, &mut modules);
-    recursive_datatypes::modules(context.env, &modules);
-    infinite_instantiations::modules(context.env, &modules);
+    dependency_ordering::program(compilation_env, &mut modules);
+    recursive_datatypes::modules(compilation_env, &modules);
+    infinite_instantiations::modules(compilation_env, &modules);
     // we extract module use funs into the module info context
-    let module_use_funs = context
-        .modules
+    let module_use_funs = info
         .modules
         .into_iter()
         .map(|(mident, minfo)| (mident, minfo.use_funs))
         .collect();
-    let module_info = TypingProgramInfo::new(pre_compiled_lib, &modules, module_use_funs);
+    let module_info =
+        TypingProgramInfo::new(compilation_env, pre_compiled_lib, &modules, module_use_funs);
     let prog = T::Program {
         modules,
+        warning_filters_table,
         info: Arc::new(module_info),
     };
-    for v in &compilation_env.visitors().typing {
-        let mut v = v.borrow_mut();
-        v.visit(compilation_env, &prog);
-    }
+    compilation_env
+        .visitors()
+        .typing
+        .par_iter()
+        .for_each(|v| v.visit(compilation_env, &prog));
     prog
 }
 
 fn extract_macros(
-    context: &mut Context,
     modules: &UniqueMap<ModuleIdent, N::ModuleDefinition>,
     pre_compiled_lib: &Option<Arc<FullyCompiledProgram>>,
-) {
+) -> UniqueMap<ModuleIdent, UniqueMap<FunctionName, N::Sequence>> {
     // Merges the methods of the module into the local methods for each macro.
     fn merge_use_funs(module_use_funs: &N::UseFuns, mut macro_use_funs: N::UseFuns) -> N::UseFuns {
         let N::UseFuns {
@@ -106,7 +104,7 @@ fn extract_macros(
             implicit_candidates,
         } = module_use_funs;
         for (tn, module_methods) in resolved {
-            let macro_methods = macro_use_funs.resolved.entry(tn.clone()).or_default();
+            let macro_methods = macro_use_funs.resolved.entry(*tn).or_default();
             for (name, method) in module_methods.key_cloned_iter() {
                 if !macro_methods.contains_key(&name) {
                     macro_methods.add(name, method.clone()).unwrap();
@@ -140,7 +138,7 @@ fn extract_macros(
         ))
         .unwrap();
 
-    let all_macro_definitions = all_modules.map(|_mident, mdef| {
+    all_modules.map(|_mident, mdef| {
         mdef.functions.ref_filter_map(|_name, f| {
             let _macro_loc = f.macro_?;
             if let N::FunctionBody_::Defined((use_funs, body)) = &f.body.value {
@@ -150,28 +148,50 @@ fn extract_macros(
                 None
             }
         })
-    });
-
-    context.set_macros(all_macro_definitions);
+    })
 }
 
 fn modules(
-    context: &mut Context,
+    compilation_env: &CompilationEnv,
+    info: &mut NamingProgramInfo,
+    all_macro_definitions: &UniqueMap<ModuleIdent, UniqueMap<FunctionName, N::Sequence>>,
     mut modules: UniqueMap<ModuleIdent, N::ModuleDefinition>,
 ) -> UniqueMap<ModuleIdent, T::ModuleDefinition> {
-    let mut all_new_friends = BTreeMap::new();
+    let global_use_funs = global_use_funs(info);
     // We validate the syntax methods first so that processing syntax method forms later are
     // better-typed. It would be preferable to do this in naming, but the typing machinery makes it
     // much easier to enforce the typeclass-like constraints. We also update the program info to
     // reflect any changes that happened.
-    for (key, mdef) in modules.key_cloned_iter_mut() {
-        validate_syntax_methods(context, &key, mdef);
-        context
-            .modules
-            .set_module_syntax_methods(key, mdef.syntax_methods.clone());
+    for (mident, mdef) in modules.key_cloned_iter_mut() {
+        let context = ModuleContext::new(
+            compilation_env,
+            info,
+            &global_use_funs,
+            all_macro_definitions,
+        );
+        validate_syntax_methods(&mut context.new_module_member(), &mident, mdef);
     }
-    let mut typed_modules = modules.map(|ident, mdef| {
-        let (typed_mdef, new_friends) = module(context, ident, mdef);
+    for (mident, mdef) in modules.key_cloned_iter() {
+        info.set_module_syntax_methods(mident, mdef.syntax_methods.clone());
+    }
+    let typed_modules = Mutex::new(UniqueMap::new());
+    let all_new_friends = Mutex::new(BTreeMap::new());
+    let used_module_members = Mutex::new(BTreeMap::new());
+    modules.into_par_iter().for_each(|(ident, mdef)| {
+        let (typed_mdef, new_friends, used_members) = module(
+            compilation_env,
+            info,
+            &global_use_funs,
+            all_macro_definitions,
+            ident,
+            mdef,
+        );
+        typed_modules
+            .lock()
+            .unwrap()
+            .add(ident, typed_mdef)
+            .unwrap();
+        let mut all_new_friends = all_new_friends.lock().unwrap();
         for (pub_package_module, loc) in new_friends {
             let friend = Friend {
                 attributes: UniqueMap::new(),
@@ -183,8 +203,17 @@ fn modules(
                 .or_insert_with(BTreeMap::new)
                 .insert(ident, friend);
         }
-        typed_mdef
+        let mut used_module_members = used_module_members.lock().unwrap();
+        for (mident, members) in used_members {
+            used_module_members
+                .entry(mident)
+                .or_insert_with(BTreeSet::new)
+                .extend(members);
+        }
     });
+    let mut typed_modules = typed_modules.into_inner().unwrap();
+    let all_new_friends = all_new_friends.into_inner().unwrap();
+    let used_module_members = used_module_members.into_inner().unwrap();
 
     for (mident, friends) in all_new_friends {
         let mdef = typed_modules.get_mut(&mident).unwrap();
@@ -196,21 +225,38 @@ fn modules(
     }
 
     for (_, mident, mdef) in &typed_modules {
-        unused_module_members(context, mident, mdef);
+        unused_module_members(compilation_env, &used_module_members, mident, mdef);
     }
 
     typed_modules
 }
 
-fn module(
-    context: &mut Context,
+fn module<'env>(
+    env: &'env CompilationEnv,
+    info: &'env NamingProgramInfo,
+    global_use_funs: &'env ResolvedUseFuns,
+    macros: &'env UniqueMap<ModuleIdent, UniqueMap<FunctionName, N::Sequence>>,
     ident: ModuleIdent,
     mdef: N::ModuleDefinition,
-) -> (T::ModuleDefinition, BTreeSet<(ModuleIdent, Loc)>) {
+) -> (
+    T::ModuleDefinition,
+    BTreeSet<(ModuleIdent, Loc)>,
+    BTreeMap<ModuleIdent_, BTreeSet<Symbol>>,
+) {
+    enum Member<S, E, C, F> {
+        Struct(S),
+        Enum(E),
+        Constant(C),
+        Function(F),
+    }
+
+    let mut context = ModuleContext::new(env, info, global_use_funs, macros);
+
     assert!(context.current_package.is_none());
     assert!(context.new_friends.is_empty());
 
     let N::ModuleDefinition {
+        doc,
         loc,
         warning_filter,
         package_name,
@@ -219,27 +265,71 @@ fn module(
         syntax_methods,
         use_funs,
         friends,
-        mut structs,
-        mut enums,
+        structs: nstructs,
+        enums: nenums,
         functions: nfunctions,
         constants: nconstants,
     } = mdef;
     context.current_module = Some(ident);
     context.current_package = package_name;
-    context.env.add_warning_filter_scope(warning_filter.clone());
+    context.push_warning_filter_scope(warning_filter);
     context.add_use_funs_scope(use_funs);
-    structs
-        .iter_mut()
-        .for_each(|(loc, _name, s)| struct_def(context, loc, s));
-    enums.iter_mut().for_each(|(_, _, e)| enum_def(context, e));
-    process_attributes(context, &attributes);
-    let constants = nconstants.map(|name, c| constant(context, name, c));
-    let functions = nfunctions.map(|name, f| function(context, name, f));
-    assert!(context.constraints.is_empty());
-    context.current_package = None;
-    let use_funs = context.pop_use_funs_scope();
-    context.env.pop_warning_filter_scope();
+    process_module_attributes(&mut context, &attributes);
+    let structs = Mutex::new(UniqueMap::new());
+    let enums = Mutex::new(UniqueMap::new());
+    let constants = Mutex::new(UniqueMap::new());
+    let functions = Mutex::new(UniqueMap::new());
+    let new_friends = Mutex::new(BTreeSet::new());
+    let used_members = Mutex::new(BTreeMap::new());
+    let used_methods = Mutex::new(BTreeSet::new());
+    nstructs
+        .into_par_iter()
+        .map(Member::Struct)
+        .chain(nenums.into_par_iter().map(Member::Enum))
+        .chain(nconstants.into_par_iter().map(Member::Constant))
+        .chain(nfunctions.into_par_iter().map(Member::Function))
+        .for_each(|member| {
+            let mut context = context.new_module_member();
+            match member {
+                Member::Struct((name, mut s)) => {
+                    struct_def(&mut context, name.loc(), &mut s);
+                    structs.lock().unwrap().add(name, s).unwrap();
+                }
+                Member::Enum((name, mut e)) => {
+                    enum_def(&mut context, &mut e);
+                    enums.lock().unwrap().add(name, e).unwrap();
+                }
+                Member::Constant((name, c)) => {
+                    let c = constant(&mut context, name, c);
+                    constants.lock().unwrap().add(name, c).unwrap();
+                }
+                Member::Function((name, f)) => {
+                    let f = function(&mut context, name, f);
+                    functions.lock().unwrap().add(name, f).unwrap();
+                }
+            };
+            let (cur_new_friends, cur_used_members, cur_used_methods) = context.finish();
+            new_friends.lock().unwrap().extend(cur_new_friends);
+            let mut used_members = used_members.lock().unwrap();
+            for (mident, members) in cur_used_members {
+                used_members
+                    .entry(mident)
+                    .or_insert_with(BTreeSet::new)
+                    .extend(members);
+            }
+            used_methods.lock().unwrap().extend(cur_used_methods);
+        });
+    let structs = structs.into_inner().unwrap();
+    let enums = enums.into_inner().unwrap();
+    let constants = constants.into_inner().unwrap();
+    let functions = functions.into_inner().unwrap();
+    let new_friends = new_friends.into_inner().unwrap();
+    let used_members = used_members.into_inner().unwrap();
+    let used_methods = used_methods.into_inner().unwrap();
+
+    let use_funs = context.finish_use_funs_scope(&used_methods);
     let typed_module = T::ModuleDefinition {
+        doc,
         loc,
         warning_filter,
         package_name,
@@ -256,13 +346,11 @@ fn module(
         constants,
         functions,
     };
-    // get the list of new friends and reset the list.
-    let new_friends = std::mem::take(&mut context.new_friends);
-    (typed_module, new_friends)
+    (typed_module, new_friends, used_members)
 }
 
 fn finalize_ide_info(context: &mut Context) {
-    if !context.env.ide_mode() {
+    if !context.env().ide_mode() {
         assert!(context.ide_info.is_empty());
         return;
     }
@@ -270,7 +358,7 @@ fn finalize_ide_info(context: &mut Context) {
     for (_loc, ann) in info.iter_mut() {
         expand::ide_annotation(context, ann);
     }
-    context.env.extend_ide_info(info);
+    context.extend_ide_info(info);
 }
 
 //**************************************************************************************************
@@ -279,23 +367,24 @@ fn finalize_ide_info(context: &mut Context) {
 
 fn function(context: &mut Context, name: FunctionName, f: N::Function) -> T::Function {
     let N::Function {
+        doc,
         warning_filter,
         index,
         attributes,
+        loc,
         visibility,
         entry,
         macro_,
         mut signature,
         body: n_body,
     } = f;
-    context.env.add_warning_filter_scope(warning_filter.clone());
+    context.push_warning_filter_scope(warning_filter);
     assert!(context.constraints.is_empty());
-    context.reset_for_module_item(name.loc());
     context.current_function = Some(name);
     context.in_macro_function = macro_.is_some();
     process_attributes(context, &attributes);
     let compiled_visibility =
-        match public_testing_visibility(context.env, context.current_package, &name, entry) {
+        match public_testing_visibility(context.env(), context.current_package(), &name, entry) {
             Some(PublicForTesting::Entry(loc)) => Visibility::Public(loc),
             None => visibility,
         };
@@ -309,11 +398,13 @@ fn function(context: &mut Context, name: FunctionName, f: N::Function) -> T::Fun
     finalize_ide_info(context);
     context.current_function = None;
     context.in_macro_function = false;
-    context.env.pop_warning_filter_scope();
+    context.pop_warning_filter_scope();
     T::Function {
+        doc,
         warning_filter,
         index,
         attributes,
+        loc,
         compiled_visibility,
         visibility,
         entry,
@@ -353,7 +444,7 @@ fn function_body(context: &mut Context, sp!(loc, nb_): N::FunctionBody) -> T::Fu
     let mut b_ = match nb_ {
         N::FunctionBody_::Native => T::FunctionBody_::Native,
         N::FunctionBody_::Defined(es) => {
-            debug_print!(context.debug.function_translation, ("input" => es));
+            debug_print!(context.debug().function_translation, ("input" => es));
             let seq = sequence(context, es);
             let ety = sequence_type(&seq);
             let ret_ty = context.return_type.clone().unwrap();
@@ -372,7 +463,7 @@ fn function_body(context: &mut Context, sp!(loc, nb_): N::FunctionBody) -> T::Fu
     core::solve_constraints(context);
     expand::function_body_(context, &mut b_);
     match_analysis::function_body_(context, &mut b_);
-    debug_print!(context.debug.function_translation, ("output" => b_));
+    debug_print!(context.debug().function_translation, ("output" => b_));
     sp(loc, b_)
 }
 
@@ -380,11 +471,11 @@ fn function_body(context: &mut Context, sp!(loc, nb_): N::FunctionBody) -> T::Fu
 // Constants
 //**************************************************************************************************
 
-fn constant(context: &mut Context, name: ConstantName, nconstant: N::Constant) -> T::Constant {
+fn constant(context: &mut Context, _name: ConstantName, nconstant: N::Constant) -> T::Constant {
     assert!(context.constraints.is_empty());
-    context.reset_for_module_item(name.loc());
 
     let N::Constant {
+        doc,
         warning_filter,
         index,
         attributes,
@@ -392,7 +483,7 @@ fn constant(context: &mut Context, name: ConstantName, nconstant: N::Constant) -
         signature,
         value: nvalue,
     } = nconstant;
-    context.env.add_warning_filter_scope(warning_filter.clone());
+    context.push_warning_filter_scope(warning_filter);
 
     process_attributes(context, &attributes);
 
@@ -421,12 +512,13 @@ fn constant(context: &mut Context, name: ConstantName, nconstant: N::Constant) -
     expand::exp(context, &mut value);
 
     check_valid_constant::exp(context, &value);
-    if context.env.ide_mode() {
+    if context.env().ide_mode() {
         finalize_ide_info(context);
     }
-    context.env.pop_warning_filter_scope();
+    context.pop_warning_filter_scope();
 
     T::Constant {
+        doc,
         warning_filter,
         index,
         attributes,
@@ -501,9 +593,7 @@ mod check_valid_constant {
             core::error_format(ty, &Subst::empty()),
             format_comma(tys),
         );
-        context
-            .env
-            .add_diag(diag!(code, (sloc, fmsg()), (loc, tmsg)))
+        context.add_diag(diag!(code, (sloc, fmsg()), (loc, tmsg)))
     }
 
     pub fn exp(context: &mut Context, e: &T::Exp) {
@@ -570,10 +660,12 @@ mod check_valid_constant {
                 s = format!("'{}' is", b);
                 &s
             }
-            E::IfElse(eb, et, ef) => {
+            E::IfElse(eb, et, ef_opt) => {
                 exp(context, eb);
                 exp(context, et);
-                exp(context, ef);
+                if let Some(ef) = ef_opt {
+                    exp(context, ef)
+                }
                 "'if' expressions are"
             }
             E::Match(esubject, sp!(_, arms)) => {
@@ -587,7 +679,7 @@ mod check_valid_constant {
                 "'match' expressions are"
             }
             E::VariantMatch(_subject, _, _arms) => {
-                context.env.add_diag(ice!((
+                context.add_diag(ice!((
                     *loc,
                     "shouldn't find variant match before match compilation"
                 )));
@@ -640,7 +732,7 @@ mod check_valid_constant {
                 "Enum variants are"
             }
         };
-        context.env.add_diag(diag!(
+        context.add_diag(diag!(
             TypeSafety::UnsupportedConstant,
             (*loc, format!("{} not supported in constants", error_case))
         ));
@@ -687,9 +779,7 @@ mod check_valid_constant {
             }
         };
         let msg = format!("{} are not supported in constants", error_case);
-        context
-            .env
-            .add_diag(diag!(TypeSafety::UnsupportedConstant, (*loc, msg),))
+        context.add_diag(diag!(TypeSafety::UnsupportedConstant, (*loc, msg),))
     }
 }
 
@@ -697,12 +787,9 @@ mod check_valid_constant {
 // Data Types
 //**************************************************************************************************
 
-fn struct_def(context: &mut Context, sloc: Loc, s: &mut N::StructDefinition) {
+fn struct_def(context: &mut Context, _sloc: Loc, s: &mut N::StructDefinition) {
     assert!(context.constraints.is_empty());
-    context.reset_for_module_item(sloc);
-    context
-        .env
-        .add_warning_filter_scope(s.warning_filter.clone());
+    context.push_warning_filter_scope(s.warning_filter);
 
     let field_map = match &mut s.fields {
         N::StructFields::Native(_) => return,
@@ -710,9 +797,10 @@ fn struct_def(context: &mut Context, sloc: Loc, s: &mut N::StructDefinition) {
     };
 
     // instantiate types and check constraints
-    for (_field_loc, _field, idx_ty) in field_map.iter() {
-        let loc = idx_ty.1.loc;
-        let inst_ty = core::instantiate(context, idx_ty.1.clone());
+    for (_field_loc, _field, idx_doc_ty) in field_map.iter() {
+        let (_idx, (_doc, ty)) = idx_doc_ty;
+        let loc = ty.loc;
+        let inst_ty = core::instantiate(context, ty.clone());
         context.add_base_type_constraint(loc, "Invalid field type", inst_ty.clone());
     }
     core::solve_constraints(context);
@@ -726,9 +814,10 @@ fn struct_def(context: &mut Context, sloc: Loc, s: &mut N::StructDefinition) {
             .iter()
             .map(|tp| sp(tp.param.user_specified_name.loc, Type_::Anything)),
     );
-    for (_field_loc, _field, idx_ty) in field_map.iter() {
-        let loc = idx_ty.1.loc;
-        let subst_ty = core::subst_tparams(tparam_subst, idx_ty.1.clone());
+    for (_field_loc, _field, idx_doc_ty) in field_map.iter() {
+        let (_idx, (_doc, ty)) = idx_doc_ty;
+        let loc = ty.loc;
+        let subst_ty = core::subst_tparams(tparam_subst, ty.clone());
         for declared_ability in declared_abilities {
             let required = declared_ability.value.requires();
             let msg = format!(
@@ -741,19 +830,18 @@ fn struct_def(context: &mut Context, sloc: Loc, s: &mut N::StructDefinition) {
     }
     core::solve_constraints(context);
 
-    for (_field_loc, _field_, idx_ty) in field_map.iter_mut() {
-        expand::type_(context, &mut idx_ty.1);
+    for (_field_loc, _field_, idx_doc_ty) in field_map.iter_mut() {
+        let (_idx, (_doc, ty)) = idx_doc_ty;
+        expand::type_(context, ty);
     }
     check_type_params_usage(context, &s.type_parameters, field_map);
-    context.env.pop_warning_filter_scope();
+    context.pop_warning_filter_scope();
 }
 
 fn enum_def(context: &mut Context, enum_: &mut N::EnumDefinition) {
     assert!(context.constraints.is_empty());
 
-    context
-        .env
-        .add_warning_filter_scope(enum_.warning_filter.clone());
+    context.push_warning_filter_scope(enum_.warning_filter);
 
     let enum_abilities = &enum_.abilities;
     let enum_type_params = &enum_.type_parameters;
@@ -766,27 +854,27 @@ fn enum_def(context: &mut Context, enum_: &mut N::EnumDefinition) {
     }
 
     check_variant_type_params_usage(context, enum_type_params, field_types);
-    context.env.pop_warning_filter_scope();
+    context.pop_warning_filter_scope();
 }
 
 fn variant_def(
     context: &mut Context,
-    vloc: Loc,
+    _vloc: Loc,
     enum_abilities: &AbilitySet,
     enum_tparams: &[DatatypeTypeParameter],
     v: &mut N::VariantDefinition,
 ) -> Vec<(usize, Type)> {
-    context.reset_for_module_item(vloc);
-
+    assert!(context.constraints.is_empty());
     let field_map = match &mut v.fields {
         N::VariantFields::Empty => return vec![],
         N::VariantFields::Defined(_, m) => m,
     };
 
     // instantiate types and check constraints
-    for (_field_loc, _field, idx_ty) in field_map.iter() {
-        let loc = idx_ty.1.loc;
-        let inst_ty = core::instantiate(context, idx_ty.1.clone());
+    for (_field_loc, _field, idx_doc_ty) in field_map.iter() {
+        let (_idx, (_doc, ty)) = idx_doc_ty;
+        let loc = ty.loc;
+        let inst_ty = core::instantiate(context, ty.clone());
         context.add_base_type_constraint(loc, "Invalid field type", inst_ty.clone());
     }
     core::solve_constraints(context);
@@ -799,9 +887,10 @@ fn variant_def(
             .iter()
             .map(|tp| sp(tp.param.user_specified_name.loc, Type_::Anything)),
     );
-    for (_field_loc, _field, idx_ty) in field_map.iter() {
-        let loc = idx_ty.1.loc;
-        let subst_ty = core::subst_tparams(tparam_subst, idx_ty.1.clone());
+    for (_field_loc, _field, idx_doc_ty) in field_map.iter() {
+        let (_idx, (_doc, ty)) = idx_doc_ty;
+        let loc = ty.loc;
+        let subst_ty = core::subst_tparams(tparam_subst, ty.clone());
         for declared_ability in enum_abilities {
             let required = declared_ability.value.requires();
             let msg = format!(
@@ -814,23 +903,24 @@ fn variant_def(
     }
     core::solve_constraints(context);
 
-    for (_field_loc, _field_, idx_ty) in field_map.iter_mut() {
-        expand::type_(context, &mut idx_ty.1);
+    for (_field_loc, _field_, idx_doc_ty) in field_map.iter_mut() {
+        let (_idx, (_doc, ty)) = idx_doc_ty;
+        expand::type_(context, ty);
     }
     field_map
         .into_iter()
-        .map(|(_, _, idx_ty)| idx_ty.clone())
+        .map(|(_, _, (idx, (_, ty)))| (*idx, ty.clone()))
         .collect::<Vec<_>>()
 }
 
 fn check_type_params_usage(
     context: &mut Context,
     type_parameters: &[N::DatatypeTypeParameter],
-    field_map: &Fields<Type>,
+    field_map: &Fields<(DocComment, Type)>,
 ) {
     let has_unresolved = field_map
         .iter()
-        .any(|(_, _, ty)| has_unresolved_error_type(&ty.1));
+        .any(|(_loc, _n, (_idx, (_doc, ty)))| has_unresolved_error_type(ty));
 
     if has_unresolved {
         return;
@@ -845,10 +935,11 @@ fn check_type_params_usage(
         .filter(|ty_param| ty_param.is_phantom)
         .map(|param| param.param.id)
         .collect();
-    for (_, _, idx_ty) in field_map.iter() {
+    for (_loc, _f, idx_doc_ty) in field_map {
+        let (_idx, (_doc, ty)) = idx_doc_ty;
         visit_type_params(
             context,
-            &idx_ty.1,
+            ty,
             ParamPos::FIELD,
             &mut |context, loc, param, pos| {
                 let param_is_phantom = phantom_params.contains(&param.id);
@@ -1027,7 +1118,7 @@ fn invalid_phantom_use_error(
         }
     };
     let decl_msg = format!("'{}' declared here as phantom", &param.user_specified_name);
-    context.env.add_diag(diag!(
+    context.add_diag(diag!(
         Declarations::InvalidPhantomUse,
         (ty_loc, msg),
         (param.user_specified_name.loc, decl_msg),
@@ -1046,9 +1137,7 @@ fn check_non_phantom_param_usage(
                 "Unused type parameter '{}'. Consider declaring it as phantom",
                 name
             );
-            context
-                .env
-                .add_diag(diag!(UnusedItem::StructTypeParam, (name.loc, msg)))
+            context.add_diag(diag!(UnusedItem::StructTypeParam, (name.loc, msg)))
         }
         Some(false) => {
             let msg = format!(
@@ -1056,9 +1145,7 @@ fn check_non_phantom_param_usage(
                  adding a phantom declaration here",
                 name
             );
-            context
-                .env
-                .add_diag(diag!(Declarations::InvalidNonPhantomUse, (name.loc, msg)))
+            context.add_diag(diag!(Declarations::InvalidNonPhantomUse, (name.loc, msg)))
         }
         Some(true) => {}
     }
@@ -1218,7 +1305,7 @@ fn subtype_no_report(
     let subst = std::mem::replace(&mut context.subst, Subst::empty());
     let lhs = core::ready_tvars(&subst, pre_lhs);
     let rhs = core::ready_tvars(&subst, pre_rhs);
-    match core::subtype(subst.clone(), &lhs, &rhs) {
+    match core::subtype(&mut context.tvar_counter, subst.clone(), &lhs, &rhs) {
         Ok((next_subst, ty)) => {
             context.subst = next_subst;
             Ok(ty)
@@ -1240,11 +1327,11 @@ fn subtype_impl<T: ToString, F: FnOnce() -> T>(
     let subst = std::mem::replace(&mut context.subst, Subst::empty());
     let lhs = core::ready_tvars(&subst, pre_lhs);
     let rhs = core::ready_tvars(&subst, pre_rhs);
-    match core::subtype(subst.clone(), &lhs, &rhs) {
+    match core::subtype(&mut context.tvar_counter, subst.clone(), &lhs, &rhs) {
         Err(e) => {
             context.subst = subst;
             let diag = typing_error(context, /* from_subtype */ true, loc, msg, e);
-            context.env.add_diag(diag);
+            context.add_diag(diag);
             Err(rhs)
         }
         Ok((next_subst, ty)) => {
@@ -1290,11 +1377,11 @@ fn join_opt<T: ToString, F: FnOnce() -> T>(
     let subst = std::mem::replace(&mut context.subst, Subst::empty());
     let t1 = core::ready_tvars(&subst, pre_t1);
     let t2 = core::ready_tvars(&subst, pre_t2);
-    match core::join(subst.clone(), &t1, &t2) {
+    match core::join(&mut context.tvar_counter, subst.clone(), &t1, &t2) {
         Err(e) => {
             context.subst = subst;
             let diag = typing_error(context, /* from_subtype */ false, loc, msg, e);
-            context.env.add_diag(diag);
+            context.add_diag(diag);
             None
         }
         Ok((next_subst, ty)) => {
@@ -1325,7 +1412,7 @@ fn invariant_no_report(
     let subst = std::mem::replace(&mut context.subst, Subst::empty());
     let lhs = core::ready_tvars(&subst, pre_lhs);
     let rhs = core::ready_tvars(&subst, pre_rhs);
-    core::invariant(subst.clone(), &lhs, &rhs).map(|(next_subst, ty)| {
+    core::invariant(&mut context.tvar_counter, subst.clone(), &lhs, &rhs).map(|(next_subst, ty)| {
         context.subst = next_subst;
         ty
     })
@@ -1342,11 +1429,11 @@ fn invariant_impl<T: ToString, F: FnOnce() -> T>(
     let subst = std::mem::replace(&mut context.subst, Subst::empty());
     let lhs = core::ready_tvars(&subst, pre_lhs);
     let rhs = core::ready_tvars(&subst, pre_rhs);
-    match core::invariant(subst.clone(), &lhs, &rhs) {
+    match core::invariant(&mut context.tvar_counter, subst.clone(), &lhs, &rhs) {
         Err(e) => {
             context.subst = subst;
             let diag = typing_error(context, /* from_subtype */ false, loc, msg, e);
-            context.env.add_diag(diag);
+            context.add_diag(diag);
             Err(rhs)
         }
         Ok((next_subst, ty)) => {
@@ -1485,6 +1572,7 @@ fn exp(context: &mut Context, ne: Box<N::Exp>) -> Box<T::Exp> {
             TE::ErrorConstant {
                 line_number_loc,
                 error_constant: None,
+                error_code: None,
             },
         ),
         NE::Unit { trailing } => (sp(eloc, Type_::Unit), TE::Unit { trailing }),
@@ -1508,13 +1596,29 @@ fn exp(context: &mut Context, ne: Box<N::Exp>) -> Box<T::Exp> {
             let ty = context.get_local_type(&var);
             (ty, TE::Use(var))
         }
-        NE::MethodCall(ndotted, f, /* is_macro */ None, ty_args_opt, sp!(argloc, nargs_)) => {
+        NE::MethodCall(
+            ndotted,
+            dot_loc,
+            f,
+            /* is_macro */ None,
+            ty_args_opt,
+            sp!(argloc, nargs_),
+        ) => {
             let edotted = process_exp_dotted(context, None, ndotted);
             let args = exp_vec(context, nargs_);
-            let ty_call_opt = method_call(context, eloc, edotted, f, ty_args_opt, argloc, args);
+            let ty_call_opt = method_call(
+                context,
+                eloc,
+                edotted,
+                f,
+                ty_args_opt,
+                argloc,
+                args,
+                dot_loc,
+            );
             match ty_call_opt {
                 None => {
-                    assert!(context.env.has_errors());
+                    assert!(context.env().has_errors());
                     (context.error_type(eloc), TE::UnresolvedError)
                 }
                 Some(ty_call) => ty_call,
@@ -1524,7 +1628,14 @@ fn exp(context: &mut Context, ne: Box<N::Exp>) -> Box<T::Exp> {
             let args = exp_vec(context, nargs_);
             module_call(context, eloc, m, f, ty_args_opt, argloc, args)
         }
-        NE::MethodCall(ndotted, f, Some(macro_call_loc), ty_args_opt, sp!(argloc, nargs_)) => {
+        NE::MethodCall(
+            ndotted,
+            dot_loc,
+            f,
+            Some(macro_call_loc),
+            ty_args_opt,
+            sp!(argloc, nargs_),
+        ) => {
             let edotted = process_exp_dotted(context, None, ndotted);
             let ty_call_opt = macro_method_call(
                 context,
@@ -1535,10 +1646,11 @@ fn exp(context: &mut Context, ne: Box<N::Exp>) -> Box<T::Exp> {
                 ty_args_opt,
                 argloc,
                 nargs_,
+                dot_loc,
             );
             match ty_call_opt {
                 None => {
-                    assert!(context.env.has_errors());
+                    assert!(context.env().has_errors());
                     (context.error_type(eloc), TE::UnresolvedError)
                 }
                 Some(ty_call) => ty_call,
@@ -1559,7 +1671,7 @@ fn exp(context: &mut Context, ne: Box<N::Exp>) -> Box<T::Exp> {
         NE::VarCall(_, sp!(_, nargs_)) => {
             exp_vec(context, nargs_);
             assert!(
-                context.env.has_errors(),
+                context.env().has_errors(),
                 "ICE unbound var call. Should be expanded"
             );
             (context.error_type(eloc), TE::UnresolvedError)
@@ -1573,7 +1685,7 @@ fn exp(context: &mut Context, ne: Box<N::Exp>) -> Box<T::Exp> {
             vector_pack(context, eloc, vec_loc, ty_opt, argloc, args_)
         }
 
-        NE::IfElse(nb, nt, nf) => {
+        NE::IfElse(nb, nt, nf_opt) => {
             let eb = exp(context, nb);
             let bloc = eb.exp.loc;
             subtype(
@@ -1584,15 +1696,24 @@ fn exp(context: &mut Context, ne: Box<N::Exp>) -> Box<T::Exp> {
                 Type_::bool(bloc),
             );
             let et = exp(context, nt);
-            let ef = exp(context, nf);
-            let ty = join(
-                context,
-                eloc,
-                || "Incompatible branches",
-                et.ty.clone(),
-                ef.ty.clone(),
-            );
-            (ty, TE::IfElse(eb, et, ef))
+            let ef_opt = nf_opt.map(|nf| exp(context, nf));
+            let ty = match &ef_opt {
+                Some(ef) => join(
+                    context,
+                    eloc,
+                    || "Incompatible branches",
+                    et.ty.clone(),
+                    ef.ty.clone(),
+                ),
+                None => {
+                    let ty = sp(eloc, Type_::Unit);
+                    let msg =
+                        "Invalid 'if'. The body of an 'if' without an 'else' must have type '()'";
+                    subtype(context, eloc, || msg, et.ty.clone(), ty.clone());
+                    ty
+                }
+            };
+            (ty, TE::IfElse(eb, et, ef_opt))
         }
         NE::Match(nsubject, sp!(aloc, narms_)) => {
             let esubject = exp(context, nsubject);
@@ -1610,7 +1731,7 @@ fn exp(context: &mut Context, ne: Box<N::Exp>) -> Box<T::Exp> {
                 }
             };
             let result_type = core::make_tvar(context, aloc);
-            let earms = match_arms(context, &subject_type, &result_type, narms_, &ref_mut);
+            let earms = match_arms(context, &esubject.ty, &result_type, narms_, &ref_mut);
             (result_type, TE::Match(esubject, sp(aloc, earms)))
         }
         NE::While(name, nb, nloop) => {
@@ -1663,14 +1784,9 @@ fn exp(context: &mut Context, ne: Box<N::Exp>) -> Box<T::Exp> {
             res
         }
         NE::Lambda(_) => {
-            if context
-                .env
-                .check_feature(context.current_package, FeatureGate::Lambda, eloc)
-            {
+            if context.check_feature(context.current_package(), FeatureGate::Lambda, eloc) {
                 let msg = "Lambdas can only be used directly as arguments to 'macro' functions";
-                context
-                    .env
-                    .add_diag(diag!(TypeSafety::UnexpectedLambda, (eloc, msg)))
+                context.add_diag(diag!(TypeSafety::UnexpectedLambda, (eloc, msg)))
             }
             (context.error_type(eloc), TE::UnresolvedError)
         }
@@ -1885,7 +2001,7 @@ fn exp(context: &mut Context, ne: Box<N::Exp>) -> Box<T::Exp> {
             (rhs, e_)
         }
         NE::UnresolvedError => {
-            assert!(context.env.has_errors());
+            assert!(context.env().has_errors());
             (context.error_type(eloc), TE::UnresolvedError)
         }
 
@@ -1907,7 +2023,7 @@ fn binop(
     let (ty, operand_ty) = match &bop.value {
         Eq | Neq
             if context
-                .env
+                .env()
                 .supports_feature(context.current_package(), FeatureGate::AutoborrowEq) =>
         {
             let lhs_type = core::ready_tvars(&context.subst, el.ty.clone());
@@ -2030,9 +2146,7 @@ fn binop(
         }
 
         Range | Implies | Iff => {
-            context
-                .env
-                .add_diag(ice!((loc, "ICE unexpect specification operator")));
+            context.add_diag(ice!((loc, "ICE unexpect specification operator")));
             (context.error_type(loc), context.error_type(loc))
         }
     };
@@ -2310,9 +2424,7 @@ fn match_pattern_(
                      matched in the module in which they are declared",
                     &m, &struct_,
                 );
-                context
-                    .env
-                    .add_diag(diag!(TypeSafety::Visibility, (loc, msg)));
+                context.add_diag(diag!(TypeSafety::Visibility, (loc, msg)));
             }
             let bt = rtype!(bt);
             let pat_ = if field_error {
@@ -2662,7 +2774,7 @@ fn lvalue(
             TL::Ignore
         }
         NL::Error => {
-            assert!(context.env.has_errors());
+            assert!(context.env().has_errors());
             TL::Ignore
         }
         NL::Var {
@@ -2795,7 +2907,7 @@ fn resolve_field(context: &mut Context, loc: Loc, ty: Type, field: &Field) -> Ty
     match core::ready_tvars(&context.subst, ty) {
         sp!(_, UnresolvedError) => context.error_type(loc),
         sp!(tloc, Anything) => {
-            context.env.add_diag(diag!(
+            context.add_diag(diag!(
                 TypeSafety::UninferredType,
                 (loc, msg()),
                 (tloc, UNINFERRED_MSG),
@@ -2803,7 +2915,7 @@ fn resolve_field(context: &mut Context, loc: Loc, ty: Type, field: &Field) -> Ty
             context.error_type(loc)
         }
         sp!(tloc, Var(i)) if !context.subst.is_num_var(i) => {
-            context.env.add_diag(diag!(
+            context.add_diag(diag!(
                 TypeSafety::UninferredType,
                 (loc, msg()),
                 (tloc, UNINFERRED_MSG),
@@ -2816,9 +2928,7 @@ fn resolve_field(context: &mut Context, loc: Loc, ty: Type, field: &Field) -> Ty
                     "Invalid access of field '{field}' on the struct '{m}::{n}'. The field '{field}' can only \
                     be accessed within the module '{m}' since it defines '{n}'"
                 );
-                context
-                    .env
-                    .add_diag(diag!(TypeSafety::Visibility, (loc, msg)));
+                context.add_diag(diag!(TypeSafety::Visibility, (loc, msg)));
             }
             match context.datatype_kind(&m, &n) {
                 DatatypeKind::Struct => {
@@ -2830,9 +2940,7 @@ fn resolve_field(context: &mut Context, loc: Loc, ty: Type, field: &Field) -> Ty
                          structs, not enums",
                         field, &m, &n
                     );
-                    context
-                        .env
-                        .add_diag(diag!(TypeSafety::ExpectedSpecificType, (loc, msg)));
+                    context.add_diag(diag!(TypeSafety::ExpectedSpecificType, (loc, msg)));
                     context.error_type(loc)
                 }
             }
@@ -2842,7 +2950,7 @@ fn resolve_field(context: &mut Context, loc: Loc, ty: Type, field: &Field) -> Ty
                 "Expected a struct type in the current module but got: {}",
                 core::error_format(&t, &context.subst)
             );
-            context.env.add_diag(diag!(
+            context.add_diag(diag!(
                 TypeSafety::ExpectedSpecificType,
                 (loc, msg()),
                 (t.loc, smsg),
@@ -2870,7 +2978,7 @@ fn add_struct_field_types<T>(
                  constructed/deconstructed, and their fields cannot be dirctly accessed",
                 verb, m, n
             );
-            context.env.add_diag(diag!(
+            context.add_diag(diag!(
                 TypeSafety::InvalidNativeUsage,
                 (loc, msg),
                 (nloc, "Struct declared 'native' here")
@@ -2878,24 +2986,22 @@ fn add_struct_field_types<T>(
             return fields.map(|f, (idx, x)| (idx, (context.error_type(f.loc()), x)));
         }
     };
-    for (_, f_, _) in &fields_ty {
+    for (_loc, f_, _idx_doc_ty) in &fields_ty {
         if fields.get_(f_).is_none() {
             let msg = format!("Missing {} for field '{}' in '{}::{}'", verb, f_, m, n);
-            context
-                .env
-                .add_diag(diag!(TypeSafety::TooFewArguments, (loc, msg)))
+            context.add_diag(diag!(TypeSafety::TooFewArguments, (loc, msg)))
         }
     }
     fields.map(|f, (idx, x)| {
         let fty = match fields_ty.remove(&f) {
             None => {
-                context.env.add_diag(diag!(
+                context.add_diag(diag!(
                     NameResolution::UnboundField,
                     (loc, format!("Unbound field '{}' in '{}::{}'", &f, m, n))
                 ));
                 context.error_type(f.loc())
             }
-            Some((_, fty)) => fty,
+            Some((_idx, (_doc, fty))) => fty,
         };
         (idx, (fty, x))
     })
@@ -2916,35 +3022,31 @@ fn add_variant_field_types<T>(
         N::VariantFields::Defined(_, m) => m,
         N::VariantFields::Empty => {
             if !fields.is_empty() {
-                let msg = format!(
-                    "Invalid usage for empty variant '{}::{}::{}'. Empty variants do not take \
-                     any arguments.",
-                    m, n, v
+                ice_assert!(
+                    context.reporter,
+                    context.env().has_errors(),
+                    loc,
+                    "Empty variant with fields but no error from naming"
                 );
-                context
-                    .env
-                    .add_diag(diag!(TypeSafety::TooManyArguments, (loc, msg),));
                 return fields.map(|f, (idx, x)| (idx, (context.error_type(f.loc()), x)));
             } else {
                 return Fields::new();
             }
         }
     };
-    for (_, f_, _) in &fields_ty {
+    for (_loc, f_, _idx_doc_ty) in &fields_ty {
         if fields.get_(f_).is_none() {
             let msg = format!(
                 "Missing {} for field '{}' in '{}::{}::{}'",
                 verb, f_, m, n, v
             );
-            context
-                .env
-                .add_diag(diag!(TypeSafety::TooFewArguments, (loc, msg)))
+            context.add_diag(diag!(TypeSafety::TooFewArguments, (loc, msg)))
         }
     }
     fields.map(|f, (idx, x)| {
         let fty = match fields_ty.remove(&f) {
             None => {
-                context.env.add_diag(diag!(
+                context.add_diag(diag!(
                     NameResolution::UnboundField,
                     (
                         loc,
@@ -2953,7 +3055,7 @@ fn add_variant_field_types<T>(
                 ));
                 context.error_type(f.loc())
             }
-            Some((_, fty)) => fty,
+            Some((_idx, (_doc, fty))) => fty,
         };
         (idx, (fty, x))
     })
@@ -2981,7 +3083,7 @@ fn find_index_funs(context: &mut Context, loc: Loc, ty: &Type) -> Option<IndexSy
     match ty {
         sp!(_, T::UnresolvedError) => None,
         sp!(tloc, T::Anything) => {
-            context.env.add_diag(diag!(
+            context.add_diag(diag!(
                 TypeSafety::UninferredType,
                 (loc, msg()),
                 (*tloc, UNINFERRED_MSG),
@@ -2989,7 +3091,7 @@ fn find_index_funs(context: &mut Context, loc: Loc, ty: &Type) -> Option<IndexSy
             None
         }
         sp!(tloc, T::Var(_)) => {
-            context.env.add_diag(diag!(
+            context.add_diag(diag!(
                 TypeSafety::UninferredType,
                 (loc, msg()),
                 (*tloc, UNINFERRED_MSG),
@@ -2999,9 +3101,7 @@ fn find_index_funs(context: &mut Context, loc: Loc, ty: &Type) -> Option<IndexSy
         sp!(_, T::Apply(_, type_name, _)) => {
             let index_opt = core::find_index_funs(context, type_name);
             if index_opt.is_none() {
-                context
-                    .env
-                    .add_diag(diag!(Declarations::MissingSyntaxMethod, (loc, msg()),));
+                context.add_diag(diag!(Declarations::MissingSyntaxMethod, (loc, msg()),));
             }
             index_opt
         }
@@ -3010,7 +3110,7 @@ fn find_index_funs(context: &mut Context, loc: Loc, ty: &Type) -> Option<IndexSy
                 "Expected a struct or builtin type but got: {}",
                 core::error_format(ty, &context.subst)
             );
-            context.env.add_diag(diag!(
+            context.add_diag(diag!(
                 TypeSafety::ExpectedSpecificType,
                 (loc, msg()),
                 (ty.loc, smsg),
@@ -3044,9 +3144,7 @@ fn resolve_index_funs_and_type(
         return (None, context.error_type(loc));
     };
     let Some((m, f)) = index.get_name_for_typing() else {
-        context
-            .env
-            .add_diag(diag!(Declarations::MissingSyntaxMethod, (loc, msg()),));
+        context.add_diag(diag!(Declarations::MissingSyntaxMethod, (loc, msg()),));
         return (None, context.error_type(loc));
     };
     // NOTE: We don't do a visibility check here because we _just_ care about computing the return
@@ -3073,7 +3171,11 @@ fn resolve_index_funs_and_type(
 
 #[derive(Debug)]
 enum ExpDottedAccess {
-    Field(Field, /* base type */ Type),
+    Field(
+        /* dot location */ Loc,
+        Field,
+        /* base type */ Type,
+    ),
     Index {
         index_loc: Loc,
         syntax_methods: Option<IndexSyntaxMethods>,
@@ -3109,7 +3211,7 @@ impl ExpDotted {
     fn last_type(&self) -> Type {
         if let Some(accessor) = self.accessors.last() {
             match accessor {
-                ExpDottedAccess::Field(_, ty) => ty.clone(),
+                ExpDottedAccess::Field(_, _, ty) => ty.clone(),
                 ExpDottedAccess::Index { base_type, .. } => base_type.clone(),
             }
         } else {
@@ -3182,9 +3284,7 @@ fn process_exp_dotted(
             sp!(_, Type_::Ref(_, base)) => *base,
             ty @ sp!(_, Type_::UnresolvedError) => ty,
             _ => {
-                context
-                    .env
-                    .add_diag(ice!((dloc, "Index should have failed in naming")));
+                context.add_diag(ice!((dloc, "Index should have failed in naming")));
                 sp(dloc, Type_::UnresolvedError)
             }
         };
@@ -3204,7 +3304,7 @@ fn process_exp_dotted(
     ) -> ExpDotted {
         match ndot_ {
             N::ExpDotted_::Exp(e) => process_base_exp(context, constraint_verb, dloc, e),
-            N::ExpDotted_::Dot(ndot, field) => {
+            N::ExpDotted_::Dot(ndot, dot_loc, field) => {
                 let mut inner = process_exp_dotted_inner(context, Some("dot access"), *ndot);
                 assert!(inner.autocomplete_last.is_none());
                 let inner_ty = inner.last_type();
@@ -3212,7 +3312,7 @@ fn process_exp_dotted(
                 inner.loc = dloc;
                 inner
                     .accessors
-                    .push(ExpDottedAccess::Field(field, field_type));
+                    .push(ExpDottedAccess::Field(dot_loc, field, field_type));
                 inner
             }
             N::ExpDotted_::Index(ndot, sp!(argloc, nargs_)) => {
@@ -3224,16 +3324,14 @@ fn process_exp_dotted(
                 inner.accessors.push(index_access);
                 inner
             }
-            N::ExpDotted_::DotAutocomplete(loc, ndot) if context.env.ide_mode() => {
+            N::ExpDotted_::DotAutocomplete(loc, ndot) if context.env().ide_mode() => {
                 let mut inner = process_exp_dotted_inner(context, Some("dot access"), *ndot);
                 assert!(inner.autocomplete_last.is_none());
                 inner.autocomplete_last = Some(loc);
                 inner
             }
             N::ExpDotted_::DotAutocomplete(_loc, ndot) => {
-                context
-                    .env
-                    .add_diag(ice!((dloc, "Found a dot autocomplete where unsupported")));
+                context.add_diag(ice!((dloc, "Found a dot autocomplete where unsupported")));
                 // Keep going after the ICE.
                 process_exp_dotted_inner(context, constraint_verb, *ndot)
             }
@@ -3252,14 +3350,14 @@ fn exp_dotted_usage(
     let constraint_verb = match &ndotted.value {
         N::ExpDotted_::Exp(_) => None,
         _ if matches!(usage, DottedUsage::Borrow(_)) => Some("borrow"),
-        N::ExpDotted_::Dot(_, _) | N::ExpDotted_::DotAutocomplete(_, _) => Some("dot access"),
+        N::ExpDotted_::Dot(_, _, _) | N::ExpDotted_::DotAutocomplete(_, _) => Some("dot access"),
         N::ExpDotted_::Index(_, _) => Some("index"),
     };
     let edotted = process_exp_dotted(context, constraint_verb, ndotted);
     if matches!(usage, DottedUsage::Borrow(_)) && edotted.accessors.is_empty() {
         context.add_base_type_constraint(exp_loc, "Invalid borrow", edotted.base.ty.clone());
     }
-    resolve_exp_dotted(context, usage, exp_loc, edotted)
+    resolve_exp_dotted(context, usage, exp_loc, edotted, None)
 }
 
 fn exp_dotted_expression(
@@ -3273,7 +3371,7 @@ fn exp_dotted_expression(
     if matches!(usage, DottedUsage::Borrow(_)) && edotted.accessors.is_empty() {
         context.add_base_type_constraint(error_loc, "Invalid borrow", edotted.base.ty.clone());
     }
-    resolve_exp_dotted(context, usage, error_loc, edotted)
+    resolve_exp_dotted(context, usage, error_loc, edotted, None)
 }
 
 // This comment servees to document the function below. Depending on the shape of the dotted
@@ -3310,6 +3408,7 @@ fn resolve_exp_dotted(
     usage: DottedUsage,
     error_loc: Loc,
     edotted: ExpDotted,
+    method_dot_loc: Option<Loc>,
 ) -> Box<T::Exp> {
     use T::UnannotatedExp_ as TE;
 
@@ -3319,7 +3418,6 @@ fn resolve_exp_dotted(
 
     let edotted_ty = core::unfold_type(&context.subst, edotted.last_type());
     let autocomplete_last = edotted.autocomplete_last;
-
     let result = match usage {
         DottedUsage::Move(loc) => {
             match edotted.base.exp.value {
@@ -3331,7 +3429,7 @@ fn resolve_exp_dotted(
                     },
                 ),
                 TE::Constant(_, _) if edotted.accessors.is_empty() => {
-                    context.env.add_diag(diag!(
+                    context.add_diag(diag!(
                         TypeSafety::InvalidMoveOp,
                         (loc, "Invalid 'move'. Cannot 'move' constants")
                     ));
@@ -3339,14 +3437,14 @@ fn resolve_exp_dotted(
                 }
                 TE::UnresolvedError => make_exp(edotted.base.ty, TE::UnresolvedError),
                 _ if edotted.accessors.is_empty() => {
-                    context.env.add_diag(diag!(
+                    context.add_diag(diag!(
                         TypeSafety::InvalidMoveOp,
                         (loc, "Invalid 'move'. Expected a variable or path.")
                     ));
                     make_error(context)
                 }
                 _ => {
-                    if context.env.check_feature(
+                    if context.check_feature(
                         context.current_package(),
                         FeatureGate::Move2024Paths,
                         loc,
@@ -3355,9 +3453,7 @@ fn resolve_exp_dotted(
                         borrow_exp_dotted(context, error_loc, false, edotted);
                         let msg = "Invalid 'move'. 'move' works only with \
                         variables, e.g. 'move x'. 'move' on a path access is not supported";
-                        context
-                            .env
-                            .add_diag(diag!(TypeSafety::InvalidMoveOp, (loc, msg)));
+                        context.add_diag(diag!(TypeSafety::InvalidMoveOp, (loc, msg)));
                         make_error(context)
                     } else {
                         make_error(context)
@@ -3376,7 +3472,7 @@ fn resolve_exp_dotted(
                         },
                     ),
                     exp_ @ TE::Constant(_, _) => {
-                        context.env.check_feature(
+                        context.check_feature(
                             context.current_package(),
                             FeatureGate::Move2024Paths,
                             edotted.base.exp.loc,
@@ -3386,9 +3482,7 @@ fn resolve_exp_dotted(
                     TE::UnresolvedError => make_exp(edotted.base.ty, TE::UnresolvedError),
                     _ => {
                         let msg = "Invalid 'copy'. Expected a variable or path.".to_owned();
-                        context
-                            .env
-                            .add_diag(diag!(TypeSafety::InvalidCopyOp, (loc, msg)));
+                        context.add_diag(diag!(TypeSafety::InvalidCopyOp, (loc, msg)));
                         make_error(context)
                     }
                 }
@@ -3419,13 +3513,14 @@ fn resolve_exp_dotted(
     };
 
     if let Some(loc) = autocomplete_last {
-        assert!(context.env.ide_mode());
-        debug_print!(context.debug.autocomplete_resolution, ("computing autocomplete" => result; dbg));
+        assert!(context.env().ide_mode());
+        debug_print!(context.debug().autocomplete_resolution, ("computing unresolved dot autocomplete" => result; dbg));
         ide_report_autocomplete(context, &loc, &edotted_ty);
-        result
-    } else {
-        result
     }
+    if let Some(mdot_loc) = method_dot_loc {
+        ide_report_autocomplete(context, &mdot_loc, &edotted_ty);
+    }
+    result
 }
 
 //   Borrowing proceeds based on mutability and if the base expression was originally a
@@ -3473,7 +3568,7 @@ fn borrow_exp_dotted(
         };
         // lhs is immutable and current borrow is mutable
         if !cur_mut && expected_mut {
-            context.env.add_diag(diag!(
+            context.add_diag(diag!(
                 ReferenceSafety::RefTrans,
                 (loc, "Invalid mutable borrow from an immutable reference"),
                 (tyloc, "Immutable because of this position"),
@@ -3501,21 +3596,28 @@ fn borrow_exp_dotted(
             loc,
             mut_,
             Box::new(base),
-            base_type,
+            base_type.clone(),
             warn_on_constant,
         ),
         BaseRefKind::ImmRef | BaseRefKind::MutRef => Box::new(base),
     };
 
+    let mut prev_ty_opt = None;
     for accessor in accessors {
         check_mut(context, error_loc, exp.ty.clone(), mut_);
         match accessor {
-            ExpDottedAccess::Field(name, ty) => {
+            ExpDottedAccess::Field(dot_loc, name, ty) => {
                 // report autocomplete information for the IDE
                 ide_report_autocomplete(context, &name.loc(), &exp.ty);
+                if let Some(prev_ty) = &prev_ty_opt {
+                    ide_report_autocomplete(context, &dot_loc, prev_ty);
+                } else {
+                    ide_report_autocomplete(context, &dot_loc, &base_type);
+                }
                 let e_ = TE::Borrow(mut_, exp, name);
                 let ty = sp(loc, Type_::Ref(mut_, Box::new(ty)));
-                exp = Box::new(T::exp(ty, sp(loc, e_)));
+                exp = Box::new(T::exp(ty.clone(), sp(loc, e_)));
+                prev_ty_opt = Some(ty);
             }
             ExpDottedAccess::Index {
                 index_loc,
@@ -3524,12 +3626,12 @@ fn borrow_exp_dotted(
                 base_type: index_base_type,
             } => {
                 let Some(index_methods) = syntax_methods else {
-                    assert!(context.env.has_errors());
+                    assert!(context.env().has_errors());
                     exp = make_error_exp(context, loc);
                     break;
                 };
                 if matches!(index_base_type.value, Type_::UnresolvedError) {
-                    assert!(context.env.has_errors());
+                    assert!(context.env().has_errors());
                     exp = make_error_exp(context, loc);
                     break;
                 }
@@ -3539,7 +3641,6 @@ fn borrow_exp_dotted(
                     } else {
                         let msg = "Could not find a mutable index 'syntax' method";
                         context
-                            .env
                             .add_diag(diag!(Declarations::MissingSyntaxMethod, (index_loc, msg),));
                         exp = make_error_exp(context, index_loc);
                         break;
@@ -3548,15 +3649,16 @@ fn borrow_exp_dotted(
                     index.target_function
                 } else {
                     let msg = "Could not find an immutable index 'syntax' method";
-                    context
-                        .env
-                        .add_diag(diag!(Declarations::MissingSyntaxMethod, (index_loc, msg),));
+                    context.add_diag(diag!(Declarations::MissingSyntaxMethod, (index_loc, msg),));
                     exp = make_error_exp(context, index_loc);
                     break;
                 };
                 let sp!(argloc, mut args_) = args;
                 args_.insert(0, *exp);
-                let mut_type = sp(index_loc, Type_::Ref(mut_, Box::new(index_base_type)));
+                let mut_type = sp(
+                    index_loc,
+                    Type_::Ref(mut_, Box::new(index_base_type.clone())),
+                );
                 // Note that `module_call` here never raise parameter subtyping errors, since we
                 // already checked them when processing the index functions.
                 let (ret_ty, e_) = module_call(context, error_loc, m, f, None, argloc, args_);
@@ -3566,11 +3668,12 @@ fn borrow_exp_dotted(
                         core::error_format(&ret_ty, &context.subst),
                         core::error_format(&mut_type, &context.subst)
                     );
-                    context.env.add_diag(ice!((loc, msg)));
+                    context.add_diag(ice!((loc, msg)));
                     exp = make_error_exp(context, index_loc);
                     break;
                 }
                 exp = Box::new(T::exp(ret_ty, sp(index_loc, e_)));
+                prev_ty_opt = Some(index_base_type);
             }
         }
     }
@@ -3602,13 +3705,13 @@ fn exp_dotted_to_owned(
     use T::UnannotatedExp_ as TE;
     let (access_msg, access_type) = if let Some(accessor) = ed.accessors.last() {
         match accessor {
-            ExpDottedAccess::Field(name, ty) => (format!("field '{}'", name), ty.clone()),
+            ExpDottedAccess::Field(_, name, ty) => (format!("field '{}'", name), ty.clone()),
             ExpDottedAccess::Index { base_type, .. } => {
                 ("index result".to_string(), base_type.clone())
             }
         }
     } else {
-        context.env.add_diag(ice!((
+        context.add_diag(ice!((
             ed.loc,
             "Attempted to make a dotted path with no dots"
         )));
@@ -3616,22 +3719,16 @@ fn exp_dotted_to_owned(
     };
     let case = match usage {
         DottedUsage::Move(_) => {
-            context
-                .env
-                .add_diag(ice!((ed.loc, "Invalid dotted usage 'move' in to_owned")));
+            context.add_diag(ice!((ed.loc, "Invalid dotted usage 'move' in to_owned")));
             return make_error_exp(context, ed.loc);
         }
         DottedUsage::Borrow(_) => {
-            context
-                .env
-                .add_diag(ice!((ed.loc, "Invalid dotted usage 'borrow' in to_owned")));
+            context.add_diag(ice!((ed.loc, "Invalid dotted usage 'borrow' in to_owned")));
             return make_error_exp(context, ed.loc);
         }
         DottedUsage::Use => "implicit copy",
         DottedUsage::Copy(loc) => {
-            context
-                .env
-                .check_feature(context.current_package(), FeatureGate::Move2024Paths, loc);
+            context.check_feature(context.current_package(), FeatureGate::Move2024Paths, loc);
             "'copy'"
         }
     };
@@ -3715,14 +3812,12 @@ fn warn_on_constant_borrow(context: &mut Context, loc: Loc, e: &T::Exp) {
     if matches!(&e.exp.value, TE::Constant(_, _)) {
         let msg = "This access will make a new copy of the constant. \
                    Consider binding the value to a variable first to make this copy explicit";
-        context
-            .env
-            .add_diag(diag!(TypeSafety::ImplicitConstantCopy, (loc, msg)))
+        context.add_diag(diag!(TypeSafety::ImplicitConstantCopy, (loc, msg)))
     }
 }
 
 fn ide_report_autocomplete(context: &mut Context, at_loc: &Loc, in_ty: &Type) {
-    if !context.env.ide_mode() {
+    if !context.env().ide_mode() {
         return;
     }
     let mut outer_ty = in_ty.clone();
@@ -3766,27 +3861,38 @@ fn method_call(
     ty_args_opt: Option<Vec<Type>>,
     argloc: Loc,
     mut args: Vec<T::Exp>,
+    dot_loc: Loc,
 ) -> Option<(Type, T::UnannotatedExp_)> {
     use T::UnannotatedExp_ as TE;
     let mut edotted = edotted;
     let (m, f, fty, usage) =
         match method_call_resolve(context, call_loc, &edotted, method, ty_args_opt) {
             ResolvedMethodCall::Resolved(m, f, fty, usage) => (*m, f, fty, usage),
-            ResolvedMethodCall::UnknownName if context.env.ide_mode() => {
+            ResolvedMethodCall::InvalidBaseType | ResolvedMethodCall::UnknownName
+                if context.env().ide_mode() =>
+            {
                 // Even if the method name fails to resolve, we want autocomplete information.
                 edotted.autocomplete_last = Some(method.loc);
                 let err_ty = context.error_type(call_loc);
-                let dot_output =
-                    resolve_exp_dotted(context, DottedUsage::Borrow(false), call_loc, edotted);
+                let dot_output = resolve_exp_dotted(
+                    context,
+                    DottedUsage::Borrow(false),
+                    call_loc,
+                    edotted,
+                    Some(dot_loc),
+                );
                 return Some((err_ty, dot_output.exp.value));
             }
             ResolvedMethodCall::InvalidBaseType | ResolvedMethodCall::UnknownName => return None,
         };
     // report autocomplete information for the IDE
-    if context.env.ide_mode() {
+    let method_dot_loc = if context.env().ide_mode() {
         edotted.autocomplete_last = Some(method.loc);
-    }
-    let first_arg = *resolve_exp_dotted(context, usage, call_loc, edotted);
+        Some(dot_loc)
+    } else {
+        None
+    };
+    let first_arg = *resolve_exp_dotted(context, usage, call_loc, edotted, method_dot_loc);
     args.insert(0, first_arg);
     let (mut call, ret_ty) = module_call_impl(context, call_loc, m, f, fty, argloc, args);
     call.method_name = Some(method);
@@ -3837,7 +3943,7 @@ fn type_to_type_name_(
     use TypeName_ as TN;
     use Type_ as Ty;
     match &ty.value {
-        Ty::Apply(_, tn @ sp!(_, TN::ModuleType(_, _) | TN::Builtin(_)), _) => Some(tn.clone()),
+        Ty::Apply(_, tn @ sp!(_, TN::ModuleType(_, _) | TN::Builtin(_)), _) => Some(*tn),
         t => {
             let msg = match t {
                 Ty::Anything => {
@@ -3860,11 +3966,11 @@ fn type_to_type_name_(
                     )
                 }
                 Ty::UnresolvedError => {
-                    assert!(context.env.has_errors());
+                    assert!(context.env().has_errors());
                     return None;
                 }
                 Ty::Ref(_, _) | Ty::Var(_) => {
-                    context.env.add_diag(ice!((
+                    context.add_diag(ice!((
                         loc,
                         "Typing did not unfold type before resolving type name"
                     )));
@@ -3873,7 +3979,7 @@ fn type_to_type_name_(
                 Ty::Apply(_, _, _) => unreachable!(),
             };
             if report_error {
-                context.env.add_diag(diag!(
+                context.add_diag(diag!(
                     TypeSafety::InvalidMethodCall,
                     (loc, format!("Invalid {error_msg}")),
                     (ty.loc, msg),
@@ -3921,6 +4027,7 @@ fn module_call_impl(
         context,
         loc,
         || format!("Invalid call of '{}::{}'", &m, &f),
+        Some(declared),
         parameters.len(),
         argloc,
         args,
@@ -3964,18 +4071,38 @@ fn annotated_error_const(context: &mut Context, e: &mut T::Exp, abort_or_assert_
     ) = &mut e.exp
     {
         let ConstantInfo {
+            doc: _,
+            index: _,
             attributes,
             defined_loc,
             signature: _,
-        } = context.constant_info(module_ident, constant_name);
-        const_name = Some((*defined_loc, *constant_name));
-        let has_error_annotation =
-            attributes.contains_key_(&known_attributes::ErrorAttribute.into());
-
-        if has_error_annotation {
+            value: _,
+        } = context.constant_info(module_ident, constant_name).clone();
+        const_name = Some((defined_loc, *constant_name));
+        if let Some(err_attribute) = attributes.get_(&known_attributes::ErrorAttribute.into()) {
+            let attribute_fmt_msg = || {
+                format!(
+                "Expected only an error code or nothing for an error annotation, e.g., '{}' or '{}({} = <num>)'",
+                ErrorAttribute::ERROR,
+                ErrorAttribute::ERROR,
+                ErrorAttribute::CODE,
+            )
+            };
+            let error_code = match &err_attribute.value {
+                Attribute_::Name(_) => None,
+                Attribute_::Assigned(_, _) => {
+                    context.add_diag(diag!(
+                        Declarations::InvalidAttribute,
+                        (err_attribute.loc, attribute_fmt_msg())
+                    ));
+                    None
+                }
+                Attribute_::Parameterized(_, inner) => error_constant_attr_params(context, inner),
+            };
             let econst = T::UnannotatedExp_::ErrorConstant {
                 line_number_loc: *const_loc,
                 error_constant: Some(*constant_name),
+                error_code,
             };
             *e = T::exp(u64_type.clone(), sp(*const_loc, econst));
         }
@@ -4011,11 +4138,71 @@ fn annotated_error_const(context: &mut Context, e: &mut T::Exp, abort_or_assert_
             the '#[error]' attribute is added to them."
                 .to_string(),
         );
-        context.env.add_diag(err);
+        context.add_diag(err);
 
         e.ty = context.error_type(e.ty.loc);
         e.exp = sp(e.exp.loc, T::UnannotatedExp_::UnresolvedError);
     }
+}
+
+fn error_constant_attr_params(
+    context: &mut Context,
+    attributes: &UniqueMap<Spanned<AttributeName_>, Spanned<Attribute_>>,
+) -> Option<u8> {
+    let mut code = None;
+    const ERR_MSG: &str =
+        "Invalid attribute, expected an argument of the form 'code = <num>' where '<num>' is a u8";
+    for (_, _, sp!(arg_loc, arg)) in attributes.iter() {
+        match arg {
+            Attribute_::Assigned(name, rhs) => {
+                if name.value.as_str() != ErrorAttribute::CODE {
+                    context.add_diag(diag!(Declarations::InvalidAttribute, (*arg_loc, ERR_MSG)));
+                    continue;
+                };
+                let AttributeValue_::Value(sp!(_, value_)) = &rhs.value else {
+                    context.add_diag(diag!(Declarations::InvalidAttribute, (*arg_loc, ERR_MSG)));
+                    continue;
+                };
+                let new_err_code = match value_ {
+                    Value_::InferredNum(value) => {
+                        let new_err_code = u8::try_from(*value).ok();
+                        if new_err_code.is_none() {
+                            context.add_diag(diag!(
+                                Declarations::InvalidAttribute,
+                                (*arg_loc, "Error code must be a u8")
+                            ));
+                        }
+                        new_err_code
+                    }
+                    Value_::U8(value) => Some(*value),
+                    Value_::Address(_)
+                    | Value_::U16(_)
+                    | Value_::U32(_)
+                    | Value_::U64(_)
+                    | Value_::U128(_)
+                    | Value_::U256(_)
+                    | Value_::Bool(_)
+                    | Value_::Bytearray(_) => {
+                        context.add_diag(diag!(
+                            Declarations::InvalidAttribute,
+                            (*arg_loc, "Error code must be a u8")
+                        ));
+                        None
+                    }
+                };
+                if code.is_some() {
+                    assert!(context.env().has_errors());
+                    continue;
+                } else {
+                    code = new_err_code;
+                }
+            }
+            _ => {
+                context.add_diag(diag!(Declarations::InvalidAttribute, (*arg_loc, ERR_MSG)));
+            }
+        }
+    }
+    code
 }
 
 fn builtin_call(
@@ -4052,6 +4239,7 @@ fn builtin_call(
         context,
         loc,
         || format!("Invalid call of '{}'", &b_),
+        None,
         params_ty.len(),
         argloc,
         args,
@@ -4094,7 +4282,7 @@ fn syntax_call_return_ty(
     let arg_tys = {
         let msg = || format!("Invalid call of '{}::{}'", &m, &f);
         let arity = parameters.len();
-        make_arg_types(context, loc, msg, arity, argloc, tys)
+        make_arg_types(context, loc, msg, Some(declared), arity, argloc, tys)
     };
     assert!(arg_tys.len() == parameters.len());
     let mut valid = true;
@@ -4148,6 +4336,7 @@ fn vector_pack(
         context,
         eloc,
         || -> String { panic!("ICE. could not create vector args") },
+        None,
         arity,
         argloc,
         args_,
@@ -4189,13 +4378,14 @@ fn call_args<S: std::fmt::Display, F: Fn() -> S>(
     context: &mut Context,
     loc: Loc,
     msg: F,
+    arity_loc: Option<Loc>,
     arity: usize,
     argloc: Loc,
     mut args: Vec<T::Exp>,
 ) -> (Box<T::Exp>, Vec<Type>) {
     use T::UnannotatedExp_ as TE;
     let tys = args.iter().map(|e| e.ty.clone()).collect();
-    let tys = make_arg_types(context, loc, msg, arity, argloc, tys);
+    let tys = make_arg_types(context, loc, msg, arity_loc, arity, argloc, tys);
     let arg = match args.len() {
         0 => T::exp(
             sp(argloc, Type_::Unit),
@@ -4215,12 +4405,13 @@ fn make_arg_types<S: std::fmt::Display, F: Fn() -> S>(
     context: &mut Context,
     loc: Loc,
     msg: F,
+    arity_loc: Option<Loc>,
     arity: usize,
     argloc: Loc,
     mut given: Vec<Type>,
 ) -> Vec<Type> {
     let given_len = given.len();
-    core::check_call_arity(context, loc, msg, arity, argloc, given_len);
+    core::check_call_arity(context, loc, msg, arity_loc, arity, argloc, given_len);
     while given.len() < arity {
         given.push(context.error_type(argloc))
     }
@@ -4261,7 +4452,7 @@ fn check_call_target(
     } else {
         "Normal (non-'macro') function is declared here"
     };
-    context.env.add_diag(diag!(
+    context.add_diag(diag!(
         TypeSafety::InvalidCallTarget,
         (macro_call_loc, call_msg),
         (decl_loc, decl_msg),
@@ -4281,25 +4472,35 @@ fn macro_method_call(
     ty_args_opt: Option<Vec<Type>>,
     argloc: Loc,
     nargs: Vec<N::Exp>,
+    dot_loc: Loc,
 ) -> Option<(Type, T::UnannotatedExp_)> {
     let mut edotted = edotted;
     let (m, f, fty, usage) = match method_call_resolve(context, loc, &edotted, method, ty_args_opt)
     {
         ResolvedMethodCall::Resolved(m, f, fty, usage) => (*m, f, fty, usage),
-        ResolvedMethodCall::UnknownName if context.env.ide_mode() => {
+        ResolvedMethodCall::UnknownName if context.env().ide_mode() => {
             // Even if the method name fails to resolve, we want autocomplete information.
             edotted.autocomplete_last = Some(method.loc);
             let err_ty = context.error_type(loc);
-            let dot_output = resolve_exp_dotted(context, DottedUsage::Borrow(false), loc, edotted);
+            let dot_output = resolve_exp_dotted(
+                context,
+                DottedUsage::Borrow(false),
+                loc,
+                edotted,
+                Some(dot_loc),
+            );
             return Some((err_ty, dot_output.exp.value));
         }
         ResolvedMethodCall::InvalidBaseType | ResolvedMethodCall::UnknownName => return None,
     };
     // report autocomplete information for the IDE
-    if context.env.ide_mode() {
+    let method_dot_loc = if context.env().ide_mode() {
         edotted.autocomplete_last = Some(method.loc);
-    }
-    let first_arg = *resolve_exp_dotted(context, usage, loc, edotted);
+        Some(dot_loc)
+    } else {
+        None
+    };
+    let first_arg = *resolve_exp_dotted(context, usage, loc, edotted, method_dot_loc);
     let mut args = vec![macro_expand::EvalStrategy::ByValue(first_arg)];
     args.extend(
         nargs
@@ -4370,6 +4571,7 @@ fn macro_call_impl(
         context,
         loc,
         || format!("Invalid call of '{}::{}'", &m, &f),
+        None,
         parameters.len(),
         argloc,
         args.len(),
@@ -4478,14 +4680,14 @@ fn expand_macro(
 
     let valid = context.add_macro_expansion(m, f, call_loc);
     if !valid {
-        assert!(context.env.has_errors());
+        assert!(context.env().has_errors());
         return (context.error_type(call_loc), TE::UnresolvedError);
     }
     let res = match macro_expand::call(context, call_loc, m, f, type_args.clone(), args, return_ty)
     {
         None => {
-            if !(context.env.has_errors() || context.env.ide_mode()) {
-                context.env.add_diag(ice!((
+            if !(context.env().has_errors() || context.env().ide_mode()) {
+                context.add_diag(ice!((
                     call_loc,
                     "No macro found, but name resolution passed."
                 )));
@@ -4522,7 +4724,7 @@ fn expand_macro(
             seq.push_back(sp(body.exp.loc, TS::Seq(body)));
             let use_funs = N::UseFuns::new(context.current_call_color());
             let block = TE::Block((use_funs, seq));
-            if context.env.ide_mode() {
+            if context.env().ide_mode() {
                 let macro_call_info = MacroCallInfo {
                     module: m,
                     name: f,
@@ -4550,9 +4752,58 @@ fn expand_macro(
 /// 1) We can track the use_fun_scope, which is used for resolving method calls correctly
 /// 2) After substitution, we can mark the Block as coming from a macro expansion which is used
 ///    for tracking recursive macro calls
-fn convert_macro_arg_to_block(context: &Context, sp!(loc, ne_): N::Exp) -> N::Exp {
+fn convert_macro_arg_to_block(context: &mut Context, sp!(loc, ne_): N::Exp) -> N::Exp {
+    fn is_lambda(ne_: &N::Exp_) -> bool {
+        match ne_ {
+            N::Exp_::Lambda(_) => true,
+            N::Exp_::Annotate(e, _) => is_lambda(&e.value),
+            _ => false,
+        }
+    }
+
+    fn gather_lambda_annotations(
+        context: &mut Context,
+        loc: Loc,
+        ne_: N::Exp_,
+        mut extra_annotations: Vec<Type>,
+    ) -> N::Exp_ {
+        match ne_ {
+            N::Exp_::Lambda(lambda) if extra_annotations.is_empty() => N::Exp_::Lambda(lambda),
+            N::Exp_::Lambda(mut lambda) => {
+                let param_tys = lambda
+                    .parameters
+                    .value
+                    .iter()
+                    .map(|(sp!(loc, _), _)| core::make_tvar(context, *loc))
+                    .collect::<Vec<_>>();
+                let res_ty = core::make_tvar(context, lambda.body.loc);
+                let tfun = sp(loc, Type_::Fun(param_tys.clone(), Box::new(res_ty.clone())));
+                for annot in extra_annotations {
+                    let annot_loc = annot.loc;
+                    subtype(
+                        context,
+                        annot_loc,
+                        || "Invalid annotation for lambda",
+                        tfun.clone(),
+                        annot,
+                    );
+                }
+                lambda.extra_annotations.push(sp(loc, (param_tys, res_ty)));
+                N::Exp_::Lambda(lambda)
+            }
+
+            N::Exp_::Annotate(e, annot) => {
+                extra_annotations.push(annot);
+                let sp!(eloc, e_) = *e;
+                gather_lambda_annotations(context, eloc, e_, extra_annotations)
+            }
+            _ => unreachable!(),
+        }
+    }
+
     let ne_ = match ne_ {
-        N::Exp_::Block(_) | N::Exp_::Lambda(_) | N::Exp_::UnresolvedError => ne_,
+        _ if is_lambda(&ne_) => gather_lambda_annotations(context, loc, ne_, vec![]),
+        N::Exp_::Block(_) | N::Exp_::UnresolvedError => ne_,
         ne_ => {
             let color = context.current_call_color();
             let seq_ = VecDeque::from([sp(loc, N::SequenceItem_::Seq(Box::new(sp(loc, ne_))))]);
@@ -4572,26 +4823,39 @@ fn convert_macro_arg_to_block(context: &Context, sp!(loc, ne_): N::Exp) -> N::Ex
 // Utils
 //**************************************************************************************************
 
-fn process_attributes<T: TName>(context: &mut Context, all_attributes: &UniqueMap<T, Attribute>) {
-    for (_, _, attr) in all_attributes {
-        match &attr.value {
-            Attribute_::Name(_) => (),
-            Attribute_::Parameterized(_, attrs) => process_attributes(context, attrs),
-            Attribute_::Assigned(_, val) => {
-                let AttributeValue_::ModuleAccess(mod_access) = &val.value else {
-                    continue;
-                };
-                if let ModuleAccess_::ModuleAccess(mident, name) = mod_access.value {
-                    // conservatively assume that each `ModuleAccess` refers to a constant name
-                    context
-                        .used_module_members
-                        .entry(mident.value)
-                        .or_default()
-                        .insert(name.value);
+macro_rules! process_attributes_impl {
+    ($rec:ident, $context:ident, $all_attributes: expr) => {
+        for (_, _, attr) in $all_attributes {
+            match &attr.value {
+                Attribute_::Name(_) => (),
+                Attribute_::Parameterized(_, attrs) => $rec($context, attrs),
+                Attribute_::Assigned(_, val) => {
+                    let AttributeValue_::ModuleAccess(mod_access) = &val.value else {
+                        continue;
+                    };
+                    if let ModuleAccess_::ModuleAccess(mident, name) = mod_access.value {
+                        // conservatively assume that each `ModuleAccess` refers to a constant name
+                        $context
+                            .used_module_members
+                            .entry(mident.value)
+                            .or_default()
+                            .insert(name.value);
+                    }
                 }
             }
         }
-    }
+    };
+}
+
+fn process_module_attributes<T: TName>(
+    context: &mut ModuleContext,
+    all_attributes: &UniqueMap<T, Attribute>,
+) {
+    process_attributes_impl!(process_module_attributes, context, all_attributes);
+}
+
+fn process_attributes<T: TName>(context: &mut Context, all_attributes: &UniqueMap<T, Attribute>) {
+    process_attributes_impl!(process_attributes, context, all_attributes);
 }
 
 //**************************************************************************************************
@@ -4600,7 +4864,12 @@ fn process_attributes<T: TName>(context: &mut Context, all_attributes: &UniqueMa
 
 /// Generates warnings for unused (private) functions and unused constants.
 /// Should be called after the whole program has been processed.
-fn unused_module_members(context: &mut Context, mident: &ModuleIdent_, mdef: &T::ModuleDefinition) {
+fn unused_module_members(
+    env: &CompilationEnv,
+    used_module_members: &BTreeMap<ModuleIdent_, BTreeSet<Symbol>>,
+    mident: &ModuleIdent_,
+    mdef: &T::ModuleDefinition,
+) {
     if !matches!(
         mdef.target_kind,
         TargetKind::Source {
@@ -4613,25 +4882,20 @@ fn unused_module_members(context: &mut Context, mident: &ModuleIdent_, mdef: &T:
         return;
     }
 
-    let is_sui_mode = context.env.package_config(mdef.package_name).flavor == Flavor::Sui;
-    context
-        .env
-        .add_warning_filter_scope(mdef.warning_filter.clone());
+    let mut reporter = env.diagnostic_reporter_at_top_level();
+    let is_sui_mode = env.package_config(mdef.package_name).flavor == Flavor::Sui;
+    reporter.push_warning_filter_scope(mdef.warning_filter);
 
     for (loc, name, c) in &mdef.constants {
-        context
-            .env
-            .add_warning_filter_scope(c.warning_filter.clone());
+        reporter.push_warning_filter_scope(c.warning_filter);
 
-        let members = context.used_module_members.get(mident);
+        let members = used_module_members.get(mident);
         if members.is_none() || !members.unwrap().contains(name) {
             let msg = format!("The constant '{name}' is never used. Consider removing it.");
-            context
-                .env
-                .add_diag(diag!(UnusedItem::Constant, (loc, msg)))
+            reporter.add_diag(diag!(UnusedItem::Constant, (loc, msg)))
         }
 
-        context.env.pop_warning_filter_scope();
+        reporter.pop_warning_filter_scope();
     }
 
     for (loc, name, fun) in &mdef.functions {
@@ -4647,11 +4911,9 @@ fn unused_module_members(context: &mut Context, mident: &ModuleIdent_, mdef: &T:
             // a Sui-specific filter to avoid signaling that the init function is unused
             continue;
         }
-        context
-            .env
-            .add_warning_filter_scope(fun.warning_filter.clone());
+        reporter.push_warning_filter_scope(fun.warning_filter);
 
-        let members = context.used_module_members.get(mident);
+        let members = used_module_members.get(mident);
         if fun.entry.is_none()
             && matches!(fun.visibility, Visibility::Internal)
             && (members.is_none() || !members.unwrap().contains(name))
@@ -4662,12 +4924,10 @@ fn unused_module_members(context: &mut Context, mident: &ModuleIdent_, mdef: &T:
                 "The non-'public', non-'entry' function '{name}' is never called. \
                 Consider removing it."
             );
-            context
-                .env
-                .add_diag(diag!(UnusedItem::Function, (loc, msg)))
+            reporter.add_diag(diag!(UnusedItem::Function, (loc, msg)))
         }
-        context.env.pop_warning_filter_scope();
+        reporter.pop_warning_filter_scope();
     }
 
-    context.env.pop_warning_filter_scope();
+    reporter.pop_warning_filter_scope();
 }

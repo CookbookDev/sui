@@ -2,11 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::Result;
-use fastcrypto::encoding::{Base64, Encoding};
 use move_core_types::annotated_value::MoveValue;
 use sui_types::SYSTEM_PACKAGE_ADDRESSES;
 
-use std::path::Path;
 use sui_data_ingestion_core::Worker;
 use tokio::sync::Mutex;
 
@@ -16,10 +14,10 @@ use crate::tables::EventEntry;
 use crate::FileType;
 use sui_json_rpc_types::type_and_fields_from_move_event_data;
 use sui_package_resolver::Resolver;
-use sui_rest_api::CheckpointData;
 use sui_types::digests::TransactionDigest;
 use sui_types::effects::TransactionEvents;
 use sui_types::event::Event;
+use sui_types::full_checkpoint_content::CheckpointData;
 
 pub struct EventHandler {
     state: Mutex<State>,
@@ -33,7 +31,9 @@ struct State {
 
 #[async_trait::async_trait]
 impl Worker for EventHandler {
-    async fn process_checkpoint(&self, checkpoint_data: CheckpointData) -> Result<()> {
+    type Result = ();
+
+    async fn process_checkpoint(&self, checkpoint_data: &CheckpointData) -> Result<()> {
         let CheckpointData {
             checkpoint_summary,
             transactions: checkpoint_transactions,
@@ -85,8 +85,7 @@ impl AnalyticsHandler<EventEntry> for EventHandler {
 }
 
 impl EventHandler {
-    pub fn new(store_path: &Path, rest_uri: &str) -> Self {
-        let package_store = LocalDBPackageStore::new(&store_path.join("event"), rest_uri);
+    pub fn new(package_store: LocalDBPackageStore) -> Self {
         let state = State {
             events: vec![],
             package_store: package_store.clone(),
@@ -131,7 +130,8 @@ impl EventHandler {
                 package: package_id.to_string(),
                 module: transaction_module.to_string(),
                 event_type: type_.to_string(),
-                bcs: Base64::encode(contents.clone()),
+                bcs: "".to_string(),
+                bcs_length: contents.len() as u64,
                 event_json: event_json.to_string(),
             };
 

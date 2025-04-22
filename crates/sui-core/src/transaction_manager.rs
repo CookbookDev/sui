@@ -9,10 +9,11 @@ use std::{
 };
 
 use lru::LruCache;
+use mysten_common::{fatal, random_util::randomize_cache_capacity_in_tests};
 use mysten_metrics::monitored_scope;
 use parking_lot::RwLock;
 use sui_types::{
-    base_types::{ObjectID, SequenceNumber, TransactionDigest},
+    base_types::{FullObjectID, SequenceNumber, TransactionDigest},
     committee::EpochId,
     digests::TransactionEffectsDigest,
     error::{SuiError, SuiResult},
@@ -82,10 +83,10 @@ pub struct PendingCertificate {
 }
 
 struct CacheInner {
-    versioned_cache: LruCache<ObjectID, SequenceNumber>,
+    versioned_cache: LruCache<FullObjectID, SequenceNumber>,
     // we cache packages separately, because they are more expensive to look up in the db, so we
     // don't want to evict packages in favor of mutable objects.
-    unversioned_cache: LruCache<ObjectID, ()>,
+    unversioned_cache: LruCache<FullObjectID, ()>,
 
     max_size: usize,
     metrics: Arc<AuthorityMetrics>,
@@ -186,7 +187,7 @@ struct AvailableObjectsCache {
 
 impl AvailableObjectsCache {
     fn new(metrics: Arc<AuthorityMetrics>) -> Self {
-        Self::new_with_size(metrics, 100000)
+        Self::new_with_size(metrics, randomize_cache_capacity_in_tests(100000))
     }
 
     fn new_with_size(metrics: Arc<AuthorityMetrics>, size: usize) -> Self {
@@ -227,7 +228,7 @@ struct Inner {
     // Stores age info for all transactions depending on each object.
     // Used for throttling signing and submitting transactions depending on hot objects.
     // An `IndexMap` is used to ensure that the insertion order is preserved.
-    input_objects: HashMap<ObjectID, TransactionQueue>,
+    input_objects: HashMap<FullObjectID, TransactionQueue>,
 
     // Maps object IDs to the highest observed sequence number of the object. When the value is
     // None, indicates that the object is immutable, corresponding to an InputKey with no sequence
@@ -410,13 +411,7 @@ impl TransactionManager {
             .filter(|(cert, _)| {
                 let digest = *cert.digest();
                 // skip already executed txes
-                if self
-                    .transaction_cache_read
-                    .is_tx_already_executed(&digest)
-                    .unwrap_or_else(|err| {
-                        panic!("Failed to check if tx is already executed: {:?}", err)
-                    })
-                {
+                if self.transaction_cache_read.is_tx_already_executed(&digest) {
                     self.metrics
                         .transaction_manager_num_enqueued_certificates
                         .with_label_values(&["already_executed"])
@@ -432,7 +427,7 @@ impl TransactionManager {
         let mut receiving_objects: HashSet<InputKey> = HashSet::new();
         let certs: Vec<_> = certs
             .into_iter()
-            .map(|(cert, fx_digest)| {
+            .filter_map(|(cert, fx_digest)| {
                 let input_object_kinds = cert
                     .data()
                     .intent_message()
@@ -440,7 +435,23 @@ impl TransactionManager {
                     .input_objects()
                     .expect("input_objects() cannot fail");
                 let mut input_object_keys =
-                    epoch_store.get_input_object_keys(&cert.key(), &input_object_kinds);
+                    match epoch_store.get_input_object_keys(&cert.key(), &input_object_kinds) {
+                        Ok(keys) => keys,
+                        Err(e) => {
+                            // Because we do not hold the transaction lock during enqueue, it is possible
+                            // that the transaction was executed and the shared version assignments deleted
+                            // since the earlier check. This is a rare race condition, and it is better to
+                            // handle it ad-hoc here than to hold tx locks for every cert for the duration
+                            // of this function in order to remove the race.
+                            if self
+                                .transaction_cache_read
+                                .is_tx_already_executed(cert.digest())
+                            {
+                                return None;
+                            }
+                            fatal!("Failed to get input object keys: {:?}", e);
+                        }
+                    };
 
                 if input_object_kinds.len() != input_object_keys.len() {
                     error!("Duplicated input objects: {:?}", input_object_kinds);
@@ -450,7 +461,8 @@ impl TransactionManager {
                     cert.data().intent_message().value.receiving_objects();
                 for entry in receiving_object_entries {
                     let key = InputKey::VersionedObject {
-                        id: entry.0,
+                        // TODO: Add support for receiving ConsensusV2 objects. For now this assumes fastpath.
+                        id: FullObjectID::new(entry.0, None),
                         version: entry.1,
                     };
                     receiving_objects.insert(key);
@@ -467,7 +479,7 @@ impl TransactionManager {
                     }
                 }
 
-                (cert, fx_digest, input_object_keys)
+                Some((cert, fx_digest, input_object_keys))
             })
             .collect();
 
@@ -500,7 +512,6 @@ impl TransactionManager {
                 receiving_objects,
                 epoch_store.epoch(),
             )
-            .unwrap_or_else(|err| panic!("Checking object existence cannot fail: {:?}", err))
             .into_iter()
             .zip(input_object_cache_misses);
 
@@ -587,10 +598,8 @@ impl TransactionManager {
                 continue;
             }
             // skip already executed txes
-            let is_tx_already_executed = self
-                .transaction_cache_read
-                .is_tx_already_executed(&digest)
-                .expect("Check if tx is already executed should not fail");
+            let is_tx_already_executed =
+                self.transaction_cache_read.is_tx_already_executed(&digest);
             if is_tx_already_executed {
                 self.metrics
                     .transaction_manager_num_enqueued_certificates
@@ -719,11 +728,11 @@ impl TransactionManager {
         output_object_keys: Vec<InputKey>,
         epoch_store: &AuthorityPerEpochStore,
     ) {
+        let _scope = monitored_scope("TransactionManager::notify_commit");
         let reconfig_lock = self.inner.read();
         {
             let commit_time = Instant::now();
             let mut inner = reconfig_lock.write();
-            let _scope = monitored_scope("TransactionManager::notify_commit::wlock");
 
             if inner.epoch != epoch_store.epoch() {
                 warn!("Ignoring committed certificate from wrong epoch. Expected={} Actual={} CertificateDigest={:?}", inner.epoch, epoch_store.epoch(), digest);
@@ -765,21 +774,11 @@ impl TransactionManager {
         self.metrics.execution_driver_dispatch_queue.inc();
     }
 
-    /// Gets the missing input object keys for the given transaction.
-    pub(crate) fn get_missing_input(&self, digest: &TransactionDigest) -> Option<Vec<InputKey>> {
-        let reconfig_lock = self.inner.read();
-        let inner = reconfig_lock.read();
-        inner
-            .pending_certificates
-            .get(digest)
-            .map(|cert| cert.waiting_input_objects.clone().into_iter().collect())
-    }
-
     // Returns the number of transactions waiting on each object ID, as well as the age of the oldest transaction in the queue.
     pub(crate) fn objects_queue_len_and_age(
         &self,
-        keys: Vec<ObjectID>,
-    ) -> Vec<(ObjectID, usize, Option<Duration>)> {
+        keys: Vec<FullObjectID>,
+    ) -> Vec<(FullObjectID, usize, Option<Duration>)> {
         let reconfig_lock = self.inner.read();
         let inner = reconfig_lock.read();
         keys.into_iter()
@@ -829,9 +828,12 @@ impl TransactionManager {
         for (object_id, queue_len, txn_age) in self.objects_queue_len_and_age(
             tx_data
                 .transaction_data()
-                .input_objects()?
+                .shared_input_objects()
                 .into_iter()
-                .map(|r| r.object_id())
+                .filter_map(|r| {
+                    r.mutable
+                        .then_some(FullObjectID::new(r.id, Some(r.initial_shared_version)))
+                })
                 .collect(),
         ) {
             // When this occurs, most likely transactions piled up on a shared object.
@@ -841,7 +843,7 @@ impl TransactionManager {
                     object_id, queue_len
                 );
                 fp_bail!(SuiError::TooManyTransactionsPendingOnObject {
-                    object_id,
+                    object_id: object_id.id(),
                     queue_len,
                     threshold: overload_config.max_transaction_manager_per_object_queue_length,
                 });
@@ -849,9 +851,13 @@ impl TransactionManager {
             if let Some(age) = txn_age {
                 // Check that we don't have a txn that has been waiting for a long time in the queue.
                 if age >= overload_config.max_txn_age_in_queue {
-                    info!("Overload detected on object {:?} with oldest transaction pending for {} secs", object_id, age.as_secs());
-                    fp_bail!(SuiError::TooOldTransactionPendingOnObject {
+                    info!(
+                        "Overload detected on object {:?} with oldest transaction pending for {}ms",
                         object_id,
+                        age.as_millis()
+                    );
+                    fp_bail!(SuiError::TooOldTransactionPendingOnObject {
+                        object_id: object_id.id(),
                         txn_age_sec: age.as_secs(),
                         threshold: overload_config.max_txn_age_in_queue.as_secs(),
                     });
@@ -863,7 +869,7 @@ impl TransactionManager {
 
     // Verify TM has no pending item for tests.
     #[cfg(test)]
-    fn check_empty_for_testing(&self) {
+    pub(crate) fn check_empty_for_testing(&self) {
         let reconfig_lock = self.inner.read();
         let inner = reconfig_lock.read();
         assert!(
@@ -1000,6 +1006,7 @@ mod test {
     use super::*;
     use prometheus::Registry;
     use rand::{Rng, RngCore};
+    use sui_types::base_types::ObjectID;
 
     #[test]
     #[cfg_attr(msim, ignore)]
@@ -1025,7 +1032,7 @@ mod test {
 
         // insert 10 unique versioned objects
         for i in 0..10 {
-            let object = ObjectID::new([i; 32]);
+            let object = FullObjectID::new(ObjectID::new([i; 32]), None);
             let input_key = InputKey::VersionedObject {
                 id: object,
                 version: (i as u64).into(),
@@ -1037,7 +1044,7 @@ mod test {
 
         // first 5 versioned objects have been evicted
         for i in 0..5 {
-            let object = ObjectID::new([i; 32]);
+            let object = FullObjectID::new(ObjectID::new([i; 32]), None);
             let input_key = InputKey::VersionedObject {
                 id: object,
                 version: (i as u64).into(),
@@ -1053,7 +1060,7 @@ mod test {
         }
 
         // object 9 is available at version 9
-        let object = ObjectID::new([9; 32]);
+        let object = FullObjectID::new(ObjectID::new([9; 32]), None);
         let input_key = InputKey::VersionedObject {
             id: object,
             version: 9.into(),

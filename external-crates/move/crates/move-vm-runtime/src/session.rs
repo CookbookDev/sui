@@ -19,6 +19,7 @@ use move_core_types::{
     resolver::MoveResolver,
     runtime_value::MoveTypeLayout,
 };
+use move_trace_format::format::MoveTraceBuilder;
 use move_vm_types::{
     data_store::DataStore,
     gas::GasMeter,
@@ -43,7 +44,7 @@ pub struct SerializedReturnValues {
     pub return_values: Vec<(Vec<u8>, MoveTypeLayout)>,
 }
 
-impl<'r, 'l, S: MoveResolver> Session<'r, 'l, S> {
+impl<'r, S: MoveResolver> Session<'r, '_, S> {
     /// Execute a Move function with the given arguments. This is mainly designed for an external
     /// environment to invoke system logic written in Move.
     ///
@@ -87,6 +88,7 @@ impl<'r, 'l, S: MoveResolver> Session<'r, 'l, S> {
             gas_meter,
             &mut self.native_extensions,
             bypass_declared_entry_check,
+            None,
         )
     }
 
@@ -98,8 +100,9 @@ impl<'r, 'l, S: MoveResolver> Session<'r, 'l, S> {
         ty_args: Vec<Type>,
         args: Vec<impl Borrow<[u8]>>,
         gas_meter: &mut impl GasMeter,
+        tracer: Option<&mut MoveTraceBuilder>,
     ) -> VMResult<SerializedReturnValues> {
-        move_vm_profiler::gas_profiler_feature_enabled! {
+        move_vm_profiler::tracing_feature_enabled! {
             use move_vm_profiler::GasProfiler;
             if gas_meter.get_profiler_mut().is_none() {
                 gas_meter.set_profiler(GasProfiler::init_default_cfg(
@@ -108,6 +111,12 @@ impl<'r, 'l, S: MoveResolver> Session<'r, 'l, S> {
                 ));
             }
         }
+
+        let tracer = if cfg!(feature = "tracing") {
+            tracer
+        } else {
+            None
+        };
 
         let bypass_declared_entry_check = true;
         self.runtime.execute_function(
@@ -119,6 +128,7 @@ impl<'r, 'l, S: MoveResolver> Session<'r, 'l, S> {
             gas_meter,
             &mut self.native_extensions,
             bypass_declared_entry_check,
+            tracer,
         )
     }
 

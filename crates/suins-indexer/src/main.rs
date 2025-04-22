@@ -107,9 +107,10 @@ impl SuinsIndexerWorker {
 
 #[async_trait]
 impl Worker for SuinsIndexerWorker {
-    async fn process_checkpoint(&self, checkpoint: CheckpointData) -> Result<()> {
+    type Result = ();
+    async fn process_checkpoint(&self, checkpoint: &CheckpointData) -> Result<()> {
         let checkpoint_seq_number = checkpoint.checkpoint_summary.sequence_number;
-        let (updates, removals) = self.indexer.process_checkpoint(&checkpoint);
+        let (updates, removals) = self.indexer.process_checkpoint(checkpoint);
 
         // every 1000 checkpoints, we will print the checkpoint sequence number
         // to the console to keep track of progress
@@ -124,6 +125,7 @@ impl Worker for SuinsIndexerWorker {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _guard = mysten_service::logging::init();
     dotenv().ok();
     let (remote_storage, registry_id, subdomain_wrapper_type, name_record_type) = (
         env::var("REMOTE_STORAGE").ok(),
@@ -173,5 +175,6 @@ async fn main() -> Result<()> {
             exit_receiver,
         )
         .await?;
+    drop(_guard);
     Ok(())
 }

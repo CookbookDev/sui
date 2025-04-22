@@ -33,6 +33,7 @@ const DEFAULT_RAND_ITERS: u64 = 10;
 
 const RAND_NUM_ITERS_FLAG: &str = "rand-num-iters";
 const SEED_FLAG: &str = "seed";
+const TRACE_FLAG: &str = "trace-execution";
 
 #[derive(Debug, Parser, Clone)]
 #[clap(author, version, about)]
@@ -121,6 +122,10 @@ pub struct UnitTestingConfig {
     // WARNING: You should only use this flag for debugging and meta-testing purposes!
     #[clap(skip)]
     pub deterministic_generation: bool,
+
+    // Enable tracing for tests
+    #[clap(long = TRACE_FLAG)]
+    pub trace_execution: bool,
 }
 
 fn format_module_id(
@@ -152,6 +157,7 @@ impl UnitTestingConfig {
             rand_num_iters: Some(DEFAULT_RAND_ITERS),
             seed: None,
             deterministic_generation: false,
+            trace_execution: false,
         }
     }
 
@@ -178,10 +184,10 @@ impl UnitTestingConfig {
                 .set_flags(flags)
                 .run::<PASS_CFGIR>()
                 .unwrap();
-        let (_, compiler) =
+        let compiler =
             diagnostics::unwrap_or_report_pass_diagnostics(&files, comments_and_compiler_res);
 
-        let (mut compiler, cfgir) = compiler.into_ast();
+        let (compiler, cfgir) = compiler.into_ast();
         let compilation_env = compiler.compilation_env();
         let test_plan = unit_test::plan_builder::construct_test_plan(compilation_env, None, &cfgir);
         let mapped_files = compilation_env.mapped_files().clone();
@@ -263,6 +269,11 @@ impl UnitTestingConfig {
         }
 
         writeln!(shared_writer.lock().unwrap(), "Running Move unit tests")?;
+        let trace_location = if self.trace_execution {
+            Some("traces".to_string())
+        } else {
+            None
+        };
         let mut test_runner = TestRunner::new(
             self.gas_limit.unwrap_or(DEFAULT_EXECUTION_BOUND),
             self.num_threads,
@@ -270,6 +281,7 @@ impl UnitTestingConfig {
             self.seed,
             rand_num_iters,
             self.deterministic_generation,
+            trace_location,
             test_plan,
             native_function_table,
             cost_table,

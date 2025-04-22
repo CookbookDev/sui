@@ -12,11 +12,11 @@ mod checked {
         sync::Arc,
     };
 
-    use crate::execution_mode::ExecutionMode;
     use crate::execution_value::{
         CommandKind, ExecutionState, ObjectContents, ObjectValue, RawValueType, Value,
     };
     use crate::gas_charger::GasCharger;
+    use crate::{execution_mode::ExecutionMode, gas_meter::SuiGasMeter};
     use move_binary_format::{
         compatibility::{Compatibility, InclusionCheck},
         errors::{Location, PartialVMResult, VMResult},
@@ -26,7 +26,7 @@ mod checked {
     };
     use move_core_types::{
         account_address::AccountAddress,
-        identifier::IdentStr,
+        identifier::{IdentStr, Identifier},
         language_storage::{ModuleId, StructTag, TypeTag},
         u256::U256,
     };
@@ -43,19 +43,20 @@ mod checked {
     use sui_types::storage::{get_package_objects, PackageObject};
     use sui_types::{
         base_types::{
-            MoveObjectType, ObjectID, SuiAddress, TxContext, TxContextKind, RESOLVED_ASCII_STR,
-            RESOLVED_STD_OPTION, RESOLVED_UTF8_STR, TX_CONTEXT_MODULE_NAME, TX_CONTEXT_STRUCT_NAME,
+            MoveLegacyTxContext, MoveObjectType, ObjectID, SuiAddress, TxContext, TxContextKind,
+            RESOLVED_ASCII_STR, RESOLVED_STD_OPTION, RESOLVED_UTF8_STR, TX_CONTEXT_MODULE_NAME,
+            TX_CONTEXT_STRUCT_NAME,
         },
         coin::Coin,
         error::{command_argument_error, ExecutionError, ExecutionErrorKind},
-        id::{RESOLVED_SUI_ID, UID},
+        id::RESOLVED_SUI_ID,
         metrics::LimitsMetrics,
         move_package::{
             normalize_deserialized_modules, MovePackage, TypeOrigin, UpgradeCap, UpgradePolicy,
             UpgradeReceipt, UpgradeTicket,
         },
         transaction::{Argument, Command, ProgrammableMoveCall, ProgrammableTransaction},
-        Identifier, SUI_FRAMEWORK_ADDRESS,
+        SUI_FRAMEWORK_ADDRESS,
     };
     use sui_verifier::{
         private_generics::{EVENT_MODULE, PRIVATE_TRANSFER_FUNCTIONS, TRANSFER_MODULE},
@@ -124,6 +125,11 @@ mod checked {
                         "input checker ensures if args are empty, there is a type specified"
                     );
                 };
+
+                // SAFETY: Preserving existing behaviour for identifier deserialization within type
+                // tags and inputs.
+                let tag = unsafe { tag.into_type_tag_unchecked() };
+
                 let elem_ty = context
                     .load_type(&tag)
                     .map_err(|e| context.convert_vm_error(e))?;
@@ -149,6 +155,10 @@ mod checked {
                 let mut arg_iter = args.into_iter().enumerate();
                 let (mut used_in_non_entry_move_call, elem_ty) = match tag_opt {
                     Some(tag) => {
+                        // SAFETY: Preserving existing behaviour for identifier deserialization within type
+                        // tags and inputs.
+                        let tag = unsafe { tag.into_type_tag_unchecked() };
+
                         let elem_ty = context
                             .load_type(&tag)
                             .map_err(|e| context.convert_vm_error(e))?;
@@ -215,7 +225,7 @@ mod checked {
                         let amount: u64 =
                             context.by_value_arg(CommandKind::SplitCoins, 1, amount_arg)?;
                         let new_coin_id = context.fresh_id()?;
-                        let new_coin = coin.split(amount, UID::new(new_coin_id))?;
+                        let new_coin = coin.split(amount, new_coin_id)?;
                         let coin_type = obj.type_.clone();
                         // safe because we are propagating the coin type, and relying on the internal
                         // invariant that coin values have a coin type
@@ -275,9 +285,17 @@ mod checked {
                     arguments,
                 } = *move_call;
 
+                // SAFETY: Preserving existing behaviour for identifier deserialization.
+                let module = unsafe { Identifier::new_unchecked(module) };
+                let function = unsafe { Identifier::new_unchecked(function) };
+
                 // Convert type arguments to `Type`s
                 let mut loaded_type_arguments = Vec::with_capacity(type_arguments.len());
                 for (ix, type_arg) in type_arguments.into_iter().enumerate() {
+                    // SAFETY: Preserving existing behaviour for identifier deserialization within type
+                    // tags and inputs.
+                    let type_arg = unsafe { type_arg.into_type_tag_unchecked() };
+
                     let ty = context
                         .load_type(&type_arg)
                         .map_err(|e| context.convert_type_argument_error(ix, e))?;
@@ -687,11 +705,18 @@ mod checked {
         };
 
         let binary_config = to_binary_config(context.protocol_config);
-        let Ok(current_normalized) = existing_package.normalize(&binary_config) else {
+        let pool = &mut normalized::RcPool::new();
+        let Ok(current_normalized) =
+            existing_package.normalize(pool, &binary_config, /* include code */ true)
+        else {
             invariant_violation!("Tried to normalize modules in existing package but failed")
         };
 
-        let mut new_normalized = normalize_deserialized_modules(upgrading_modules.into_iter());
+        let mut new_normalized = normalize_deserialized_modules(
+            pool,
+            upgrading_modules.into_iter(),
+            /* include code */ true,
+        );
         for (name, cur_module) in current_normalized {
             let Some(new_module) = new_normalized.remove(&name) else {
                 return Err(ExecutionError::new_with_source(
@@ -711,8 +736,8 @@ mod checked {
     fn check_module_compatibility(
         policy: &UpgradePolicy,
         protocol_config: &ProtocolConfig,
-        cur_module: &normalized::Module,
-        new_module: &normalized::Module,
+        cur_module: &move_binary_format::compatibility::Module,
+        new_module: &move_binary_format::compatibility::Module,
     ) -> Result<(), ExecutionError> {
         match policy {
             UpgradePolicy::Additive => InclusionCheck::Subset.check(cur_module, new_module),
@@ -726,14 +751,9 @@ mod checked {
                     };
 
                 let compatibility = Compatibility {
-                    check_datatype_and_pub_function_linking: true,
                     check_datatype_layout: true,
-                    check_friend_linking: false,
                     check_private_entry_linking: false,
                     disallowed_new_abilities,
-                    disallow_change_datatype_type_params: protocol_config
-                        .disallow_change_struct_type_params_on_upgrade(),
-                    disallow_new_variants: true,
                 };
 
                 compatibility.check(cur_module, new_module)
@@ -809,7 +829,7 @@ mod checked {
         match tx_context_kind {
             TxContextKind::None => (),
             TxContextKind::Mutable | TxContextKind::Immutable => {
-                serialized_arguments.push(context.tx_context.to_vec());
+                serialized_arguments.push(context.tx_context.to_bcs_legacy_context());
             }
         }
         // script visibility checked manually for entry points
@@ -820,7 +840,7 @@ mod checked {
                 function,
                 type_arguments,
                 serialized_arguments,
-                context.gas_charger.move_gas_status_mut(),
+                &mut SuiGasMeter(context.gas_charger.move_gas_status_mut()),
             )
             .map_err(|e| context.convert_vm_error(e))?;
 
@@ -835,7 +855,7 @@ mod checked {
             let Some((_, ctx_bytes, _)) = result.mutable_reference_outputs.pop() else {
                 invariant_violation!("Missing TxContext in reference outputs");
             };
-            let updated_ctx: TxContext = bcs::from_bytes(&ctx_bytes).map_err(|e| {
+            let updated_ctx: MoveLegacyTxContext = bcs::from_bytes(&ctx_bytes).map_err(|e| {
                 ExecutionError::invariant_violation(format!(
                     "Unable to deserialize TxContext bytes. {e}"
                 ))
@@ -889,7 +909,7 @@ mod checked {
                 AccountAddress::from(package_id),
                 // TODO: publish_module_bundle() currently doesn't charge gas.
                 // Do we want to charge there?
-                context.gas_charger.move_gas_status_mut(),
+                &mut SuiGasMeter(context.gas_charger.move_gas_status_mut()),
             )
             .map_err(|e| context.convert_vm_error(e))?;
 
@@ -1617,7 +1637,7 @@ mod checked {
 
     struct VectorElementVisitor<'a>(&'a PrimitiveArgumentLayout);
 
-    impl<'d, 'a> serde::de::Visitor<'d> for VectorElementVisitor<'a> {
+    impl<'d> serde::de::Visitor<'d> for VectorElementVisitor<'_> {
         type Value = ();
 
         fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1635,7 +1655,7 @@ mod checked {
 
     struct OptionElementVisitor<'a>(&'a PrimitiveArgumentLayout);
 
-    impl<'d, 'a> serde::de::Visitor<'d> for OptionElementVisitor<'a> {
+    impl<'d> serde::de::Visitor<'d> for OptionElementVisitor<'_> {
         type Value = ();
 
         fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

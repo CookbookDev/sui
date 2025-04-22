@@ -8,8 +8,9 @@ use move_symbol_pool::Symbol;
 use crate::{
     command_line::compiler::FullyCompiledProgram,
     diag,
+    diagnostics::DiagnosticReporter,
     parser::{
-        ast::{self as P, NamePath, PathEntry},
+        ast::{self as P, DocComment, NamePath, PathEntry},
         filter::{filter_program, FilterContext},
     },
     shared::{known_attributes, CompilationEnv},
@@ -18,13 +19,13 @@ use crate::{
 use std::sync::Arc;
 
 struct Context<'env> {
-    env: &'env mut CompilationEnv,
+    env: &'env CompilationEnv,
     is_source_def: bool,
     current_package: Option<Symbol>,
 }
 
 impl<'env> Context<'env> {
-    fn new(env: &'env mut CompilationEnv) -> Self {
+    fn new(env: &'env CompilationEnv) -> Self {
         Self {
             env,
             is_source_def: false,
@@ -92,11 +93,12 @@ pub const UNIT_TEST_POISON_FUN_NAME: Symbol = symbol!("unit_test_poison");
 // in `compilation_env` is not set. If the test flag is set, no filtering is performed, and instead
 // a test plan is created for use by the testing framework.
 pub fn program(
-    compilation_env: &mut CompilationEnv,
+    compilation_env: &CompilationEnv,
     pre_compiled_lib: Option<Arc<FullyCompiledProgram>>,
     prog: P::Program,
 ) -> P::Program {
-    if !check_has_unit_test_module(compilation_env, pre_compiled_lib, &prog) {
+    let reporter = compilation_env.diagnostic_reporter_at_top_level();
+    if !check_has_unit_test_module(compilation_env, &reporter, pre_compiled_lib, &prog) {
         return prog;
     }
 
@@ -127,7 +129,8 @@ fn has_unit_test_module(prog: &P::Program) -> bool {
 }
 
 fn check_has_unit_test_module(
-    compilation_env: &mut CompilationEnv,
+    compilation_env: &CompilationEnv,
+    reporter: &DiagnosticReporter,
     pre_compiled_lib: Option<Arc<FullyCompiledProgram>>,
     prog: &P::Program,
 ) -> bool {
@@ -145,7 +148,7 @@ fn check_has_unit_test_module(
                 P::Definition::Module(P::ModuleDefinition { name, .. }) => name.0.loc,
                 P::Definition::Address(P::AddressDefinition { loc, .. }) => *loc,
             };
-            compilation_env.add_diag(diag!(
+            reporter.add_diag(diag!(
                 Attributes::InvalidTest,
                 (
                     loc,
@@ -161,7 +164,7 @@ fn check_has_unit_test_module(
 }
 
 /// If a module is being compiled in test mode, create a dummy function that calls a native
-/// function `0x1::UnitTest::create_signers_for_testing` that only exists if the VM is being run
+/// function `0x1::unit_test::poison` that only exists if the VM is being run
 /// with the "unit_test" feature flag set. This will then cause the module to fail to link if
 /// an attempt is made to publish a module that has been compiled in test mode on a VM that is not
 /// running in test mode.
@@ -178,7 +181,7 @@ fn create_test_poison(mloc: Loc) -> P::ModuleMember {
     );
 
     let mod_name = sp(mloc, UNIT_TEST_MODULE_NAME);
-    let fn_name = sp(mloc, "create_signers_for_testing".into());
+    let fn_name = sp(mloc, symbol!("poison"));
     let name_path = NamePath {
         root: P::RootPathEntry {
             name: leading_name_access,
@@ -199,17 +202,14 @@ fn create_test_poison(mloc: Loc) -> P::ModuleMember {
         ],
         is_incomplete: false,
     };
-    let args_ = vec![sp(
-        mloc,
-        P::Exp_::Value(sp(mloc, P::Value_::Num("0".into()))),
-    )];
     let nop_call = P::Exp_::Call(
         sp(mloc, P::NameAccessChain_::Path(name_path)),
-        sp(mloc, args_),
+        sp(mloc, vec![]),
     );
 
-    // fun unit_test_poison() { 0x1::UnitTest::create_signers_for_testing(0); () }
+    // fun unit_test_poison() { 0x1::UnitTest::poison(0); () }
     P::ModuleMember::Function(P::Function {
+        doc: DocComment::empty(),
         attributes: vec![],
         loc: mloc,
         visibility: P::Visibility::Internal,

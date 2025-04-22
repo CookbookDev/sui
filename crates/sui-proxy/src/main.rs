@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
     let listener = std::net::TcpListener::bind(config.listen_address).unwrap();
 
     let (tls_config, allower) =
-        // we'll only use the dynamic peers in some cases - it makes little sense to run with the statics
+        // we'll only use the dynamic peers in some cases - it makes little sense to run with the static's
         // since this first mode allows all.
         if config.dynamic_peers.certificate_file.is_none() || config.dynamic_peers.private_key.is_none() {
             (
@@ -84,6 +84,12 @@ async fn main() -> Result<()> {
             "unavailable",
         ))
         .unwrap();
+
+    let timeout_secs = match env::var("NODE_CLIENT_TIMEOUT") {
+        Ok(val) => val.parse::<u64>().ok(),
+        Err(_) => None,
+    };
+
     let app = app(
         Labels {
             network: config.network,
@@ -93,6 +99,7 @@ async fn main() -> Result<()> {
         client,
         histogram_relay,
         allower,
+        timeout_secs,
     );
 
     server(listener, app, Some(acceptor)).await.unwrap();

@@ -39,6 +39,7 @@ const standards = [
 				items: [
 					'standards/deepbookv3/design',
 					'standards/deepbookv3/balance-manager',
+					'standards/deepbookv3/permissionless-pool',
 					'standards/deepbookv3/query-the-pool',
 					'standards/deepbookv3/orders',
 					'standards/deepbookv3/swaps',
@@ -46,6 +47,7 @@ const standards = [
 					'standards/deepbookv3/staking-governance',
 				],
 			},
+			'standards/deepbookv3-indexer',
 			{
 				type: 'category',
 				label: 'DeepBookV3 SDK',

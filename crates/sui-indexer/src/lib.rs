@@ -26,6 +26,8 @@ use crate::indexer_reader::IndexerReader;
 use errors::IndexerError;
 
 pub mod apis;
+pub mod backfill;
+pub mod config;
 pub mod database;
 pub mod db;
 pub mod errors;
@@ -34,19 +36,18 @@ pub mod indexer;
 pub mod indexer_reader;
 pub mod metrics;
 pub mod models;
+pub mod restorer;
 pub mod schema;
 pub mod store;
 pub mod system_package_task;
-pub mod tempdb;
 pub mod test_utils;
 pub mod types;
-
-pub mod config;
 
 pub async fn build_json_rpc_server(
     prometheus_registry: &Registry,
     reader: IndexerReader,
     config: &JsonRpcConfig,
+    cancel: CancellationToken,
 ) -> Result<ServerHandle, IndexerError> {
     let mut builder =
         JsonRpcServerBuilder::new(env!("CARGO_PKG_VERSION"), prometheus_registry, None, None);
@@ -64,7 +65,6 @@ pub async fn build_json_rpc_server(
     builder.register_module(CoinReadApi::new(reader.clone()))?;
     builder.register_module(ExtendedApi::new(reader.clone()))?;
 
-    let cancel = CancellationToken::new();
     let system_package_task =
         SystemPackageTask::new(reader.clone(), cancel.clone(), Duration::from_secs(10));
 
@@ -81,8 +81,7 @@ fn get_http_client(rpc_client_url: &str) -> Result<HttpClient, IndexerError> {
     headers.insert(CLIENT_SDK_TYPE_HEADER, HeaderValue::from_static("indexer"));
 
     HttpClientBuilder::default()
-        .max_request_body_size(2 << 30)
-        .max_concurrent_requests(usize::MAX)
+        .max_request_size(2 << 30)
         .set_headers(headers.clone())
         .build(rpc_client_url)
         .map_err(|e| {

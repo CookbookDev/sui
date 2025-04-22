@@ -44,6 +44,7 @@ pub struct TemporaryStore<'backing> {
     store: &'backing dyn BackingStore,
     tx_digest: TransactionDigest,
     input_objects: BTreeMap<ObjectID, Object>,
+    deleted_consensus_objects: BTreeMap<ObjectID, SequenceNumber>,
     /// The version to assign to all objects written by the transaction using this store.
     lamport_timestamp: SequenceNumber,
     mutable_input_refs: BTreeMap<ObjectID, (VersionDigest, Owner)>, // Inputs that are mutable
@@ -76,12 +77,14 @@ impl<'backing> TemporaryStore<'backing> {
     ) -> Self {
         let mutable_input_refs = input_objects.mutable_inputs();
         let lamport_timestamp = input_objects.lamport_timestamp(&[]);
+        let deleted_consensus_objects = input_objects.consensus_stream_ended_objects();
         let objects = input_objects.into_object_map();
 
         Self {
             store,
             tx_digest,
             input_objects: objects,
+            deleted_consensus_objects,
             lamport_timestamp,
             mutable_input_refs,
             written: BTreeMap::new(),
@@ -145,6 +148,7 @@ impl<'backing> TemporaryStore<'backing> {
     pub fn into_inner(self) -> InnerTemporaryStore {
         InnerTemporaryStore {
             input_objects: self.input_objects,
+            stream_ended_consensus_objects: self.deleted_consensus_objects,
             mutable_inputs: self.mutable_input_refs,
             written: self
                 .written
@@ -236,7 +240,7 @@ impl<'backing> TemporaryStore<'backing> {
         // the first coin is where all the others are merged.
         let updated_gas_object_info = if let Some(coin_id) = gas_charger.gas_coin() {
             let (object, _kind) = &self.written[&coin_id];
-            (object.compute_object_reference(), object.owner)
+            (object.compute_object_reference(), object.owner.clone())
         } else {
             (
                 (ObjectID::ZERO, SequenceNumber::default(), ObjectDigest::MIN),
@@ -249,10 +253,11 @@ impl<'backing> TemporaryStore<'backing> {
         let mut unwrapped = vec![];
         for (object, kind) in self.written.values() {
             let object_ref = object.compute_object_reference();
+            let owner = object.owner.clone();
             match kind {
-                WriteKind::Mutate => mutated.push((object_ref, object.owner)),
-                WriteKind::Create => created.push((object_ref, object.owner)),
-                WriteKind::Unwrap => unwrapped.push((object_ref, object.owner)),
+                WriteKind::Mutate => mutated.push((object_ref, owner)),
+                WriteKind::Create => created.push((object_ref, owner)),
+                WriteKind::Unwrap => unwrapped.push((object_ref, owner)),
             }
         }
 
@@ -262,7 +267,7 @@ impl<'backing> TemporaryStore<'backing> {
             .into_iter()
             .map(|shared_input| match shared_input {
                 SharedInput::Existing(oref) => oref,
-                SharedInput::Deleted(_) => {
+                SharedInput::ConsensusStreamEnded(_) => {
                     unreachable!("Shared object deletion not supported in effects v1")
                 }
                 SharedInput::Cancelled(_) => {
@@ -492,7 +497,7 @@ impl<'backing> TemporaryStore<'backing> {
     }
 }
 
-impl<'backing> TemporaryStore<'backing> {
+impl TemporaryStore<'_> {
     /// returns lists of (objects whose owner we must authenticate, objects whose owner has already been authenticated)
     fn get_objects_to_authenticate(
         &self,
@@ -534,6 +539,9 @@ impl<'backing> TemporaryStore<'backing> {
                 Owner::ObjectOwner(_parent) => {
                     unreachable!("Input objects must be address owned, shared, or immutable")
                 }
+                Owner::ConsensusV2 { .. } => {
+                    unimplemented!("ConsensusV2 does not exist for this execution version")
+                }
             }
         }
 
@@ -545,7 +553,7 @@ impl<'backing> TemporaryStore<'backing> {
                 WriteKind::Mutate => {
                     // get owner at beginning of tx, since that's what we have to authenticate against
                     // _new_obj.owner is not relevant here
-                    let old_obj = self.store.get_object(id)?.unwrap_or_else(|| {
+                    let old_obj = self.store.get_object(id).unwrap_or_else(|| {
                         panic!("Mutated object must exist in the store: ID = {:?}", id)
                     });
                     match &old_obj.owner {
@@ -564,6 +572,9 @@ impl<'backing> TemporaryStore<'backing> {
                                 "Only system packages can be upgraded"
                             );
                         }
+                        Owner::ConsensusV2 { .. } => {
+                            unimplemented!("ConsensusV2 does not exist for this execution version")
+                        }
                     }
                 }
                 WriteKind::Create | WriteKind::Unwrap => {
@@ -580,7 +591,7 @@ impl<'backing> TemporaryStore<'backing> {
             match kind {
                 DeleteKindWithOldVersion::Normal(_) | DeleteKindWithOldVersion::Wrap(_) => {
                     // get owner at beginning of tx
-                    let old_obj = self.store.get_object(id)?.unwrap();
+                    let old_obj = self.store.get_object(id).unwrap();
                     match &old_obj.owner {
                         Owner::ObjectOwner(_) => {
                             objs_to_authenticate.push(*id);
@@ -589,6 +600,9 @@ impl<'backing> TemporaryStore<'backing> {
                             unreachable!("Should already be in authenticated_objs")
                         }
                         Owner::Immutable => unreachable!("Immutable objects cannot be deleted"),
+                        Owner::ConsensusV2 { .. } => {
+                            unimplemented!("ConsensusV2 does not exist for this execution version")
+                        }
                     }
                 }
                 DeleteKindWithOldVersion::UnwrapThenDelete
@@ -614,7 +628,7 @@ impl<'backing> TemporaryStore<'backing> {
         // Map from an ObjectID to the ObjectID that covers it.
         let mut covered = BTreeMap::new();
         while let Some(to_authenticate) = objects_to_authenticate.pop() {
-            let Some(old_obj) = self.store.get_object(&to_authenticate)? else {
+            let Some(old_obj) = self.store.get_object(&to_authenticate) else {
                 // lookup failure is expected when the parent is an "object-less" UID (e.g., the ID of a table or bag)
                 // we cannot distinguish this case from an actual authentication failure, so continue
                 continue;
@@ -639,7 +653,7 @@ impl<'backing> TemporaryStore<'backing> {
     }
 }
 
-impl<'backing> TemporaryStore<'backing> {
+impl TemporaryStore<'_> {
     /// Return the storage rebate of object `id`
     fn get_input_storage_rebate(&self, id: &ObjectID, expected_version: SequenceNumber) -> u64 {
         // A mutated object must either be from input object or child object.
@@ -648,7 +662,7 @@ impl<'backing> TemporaryStore<'backing> {
         } else if let Some(metadata) = self.loaded_child_objects.get(id) {
             debug_assert_eq!(metadata.version, expected_version);
             metadata.storage_rebate
-        } else if let Ok(Some(obj)) = self.store.get_object_by_key(id, expected_version) {
+        } else if let Some(obj) = self.store.get_object_by_key(id, expected_version) {
             // The only case where an modified input object is not in the input list nor child object,
             // is when we upgrade a system package during epoch change.
             debug_assert!(obj.is_package());
@@ -693,7 +707,7 @@ impl<'backing> TemporaryStore<'backing> {
                     } else {
                         // else, this is a dynamic field, not an input object
                         let expected_version = object.version();
-                        if let Ok(Some(old_obj)) =
+                        if let Some(old_obj) =
                             self.store.get_object_by_key(object_id, expected_version)
                         {
                             old_obj.storage_rebate
@@ -745,7 +759,7 @@ impl<'backing> TemporaryStore<'backing> {
 // Charge gas current - end
 //==============================================================================
 
-impl<'backing> TemporaryStore<'backing> {
+impl TemporaryStore<'_> {
     pub fn advance_epoch_safe_mode(
         &mut self,
         params: &AdvanceEpochParams,
@@ -761,7 +775,7 @@ impl<'backing> TemporaryStore<'backing> {
 
 type ModifiedObjectInfo<'a> = (ObjectID, Option<(SequenceNumber, u64)>, Option<&'a Object>);
 
-impl<'backing> TemporaryStore<'backing> {
+impl TemporaryStore<'_> {
     fn get_input_sui(
         &self,
         id: &ObjectID,
@@ -787,7 +801,7 @@ impl<'backing> TemporaryStore<'backing> {
             })
         } else {
             // not in input objects, must be a dynamic field
-            let Ok(Some(obj)) = self.store.get_object_by_key(id, expected_version) else {
+            let Some(obj) = self.store.get_object_by_key(id, expected_version) else {
                 invariant_violation!(
                     "Failed looking up dynamic field {id} in SUI conservation checking"
                 );
@@ -931,7 +945,7 @@ impl<'backing> TemporaryStore<'backing> {
     }
 }
 
-impl<'backing> ChildObjectResolver for TemporaryStore<'backing> {
+impl ChildObjectResolver for TemporaryStore<'_> {
     fn read_child_object(
         &self,
         parent: &ObjectID,
@@ -969,7 +983,7 @@ impl<'backing> ChildObjectResolver for TemporaryStore<'backing> {
     }
 }
 
-impl<'backing> Storage for TemporaryStore<'backing> {
+impl Storage for TemporaryStore<'_> {
     fn reset(&mut self) {
         TemporaryStore::drop_writes(self);
     }
@@ -1010,14 +1024,14 @@ impl<'backing> Storage for TemporaryStore<'backing> {
     }
 }
 
-impl<'backing> BackingPackageStore for TemporaryStore<'backing> {
+impl BackingPackageStore for TemporaryStore<'_> {
     fn get_package_object(&self, package_id: &ObjectID) -> SuiResult<Option<PackageObject>> {
         if let Some((obj, _)) = self.written.get(package_id) {
             Ok(Some(PackageObject::new(obj.clone())))
         } else {
-            self.store.get_package_object(package_id).map(|obj| {
+            self.store.get_package_object(package_id).inspect(|obj| {
                 // Track object but leave unchanged
-                if let Some(v) = &obj {
+                if let Some(v) = obj {
                     if !self
                         .runtime_packages_loaded_from_db
                         .read()
@@ -1030,13 +1044,12 @@ impl<'backing> BackingPackageStore for TemporaryStore<'backing> {
                             .insert(*package_id, v.clone());
                     }
                 }
-                obj
             })
         }
     }
 }
 
-impl<'backing> ResourceResolver for TemporaryStore<'backing> {
+impl ResourceResolver for TemporaryStore<'_> {
     type Error = SuiError;
 
     fn get_resource(
@@ -1074,11 +1087,8 @@ impl<'backing> ResourceResolver for TemporaryStore<'backing> {
     }
 }
 
-impl<'backing> ParentSync for TemporaryStore<'backing> {
-    fn get_latest_parent_entry_ref_deprecated(
-        &self,
-        object_id: ObjectID,
-    ) -> SuiResult<Option<ObjectRef>> {
+impl ParentSync for TemporaryStore<'_> {
+    fn get_latest_parent_entry_ref_deprecated(&self, object_id: ObjectID) -> Option<ObjectRef> {
         self.store.get_latest_parent_entry_ref_deprecated(object_id)
     }
 }

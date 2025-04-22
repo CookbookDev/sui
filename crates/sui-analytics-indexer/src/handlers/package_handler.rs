@@ -2,9 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::Result;
-use fastcrypto::encoding::{Base64, Encoding};
 use sui_data_ingestion_core::Worker;
-use sui_rest_api::CheckpointData;
+use sui_types::full_checkpoint_content::CheckpointData;
 use sui_types::full_checkpoint_content::CheckpointTransaction;
 use sui_types::object::Object;
 use tokio::sync::Mutex;
@@ -23,7 +22,9 @@ struct State {
 
 #[async_trait::async_trait]
 impl Worker for PackageHandler {
-    async fn process_checkpoint(&self, checkpoint_data: CheckpointData) -> Result<()> {
+    type Result = ();
+
+    async fn process_checkpoint(&self, checkpoint_data: &CheckpointData) -> Result<()> {
         let CheckpointData {
             checkpoint_summary,
             transactions: checkpoint_transactions,
@@ -35,7 +36,7 @@ impl Worker for PackageHandler {
                 checkpoint_summary.epoch,
                 checkpoint_summary.sequence_number,
                 checkpoint_summary.timestamp_ms,
-                &checkpoint_transaction,
+                checkpoint_transaction,
                 &mut state,
             )?;
         }
@@ -97,7 +98,8 @@ impl PackageHandler {
                 checkpoint,
                 epoch,
                 timestamp_ms,
-                bcs: Base64::encode(bcs::to_bytes(p).unwrap()),
+                bcs: "".to_string(),
+                bcs_length: bcs::to_bytes(object).unwrap().len() as u64,
                 transaction_digest: object.previous_transaction.to_string(),
                 original_package_id: Some(original_package_id.to_string()),
             };

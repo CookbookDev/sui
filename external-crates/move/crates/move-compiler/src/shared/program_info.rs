@@ -1,30 +1,34 @@
 // Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::BTreeMap, fmt::Display, sync::Arc};
+use std::{collections::BTreeMap, fmt::Display, sync::Arc, sync::OnceLock};
 
-use move_ir_types::location::Loc;
-use move_symbol_pool::Symbol;
-
+use self::known_attributes::AttributePosition;
 use crate::{
-    expansion::ast::{AbilitySet, Attributes, ModuleIdent, TargetKind, Visibility},
+    expansion::ast::{AbilitySet, Attributes, ModuleIdent, Visibility},
     naming::ast::{
         self as N, DatatypeTypeParameter, EnumDefinition, FunctionSignature, ResolvedUseFuns,
         StructDefinition, SyntaxMethods, Type,
     },
-    parser::ast::{ConstantName, DatatypeName, Field, FunctionName, VariantName},
-    shared::unique_map::UniqueMap,
-    shared::*,
+    parser::ast::{
+        ConstantName, DatatypeName, DocComment, Field, FunctionName, TargetKind, VariantName,
+    },
+    shared::{unique_map::UniqueMap, *},
+    sui_mode::info::SuiInfo,
     typing::ast::{self as T},
     FullyCompiledProgram,
 };
-
-use self::known_attributes::AttributePosition;
+use move_core_types::runtime_value;
+use move_ir_types::location::Loc;
+use move_symbol_pool::Symbol;
 
 #[derive(Debug, Clone)]
 pub struct FunctionInfo {
+    pub doc: DocComment,
+    pub index: usize,
     pub attributes: Attributes,
     pub defined_loc: Loc,
+    pub full_loc: Loc,
     pub visibility: Visibility,
     pub entry: Option<Loc>,
     pub macro_: Option<Loc>,
@@ -33,13 +37,19 @@ pub struct FunctionInfo {
 
 #[derive(Debug, Clone)]
 pub struct ConstantInfo {
+    pub doc: DocComment,
+    pub index: usize,
     pub attributes: Attributes,
     pub defined_loc: Loc,
     pub signature: Type,
+    // Set after compilation
+    pub value: OnceLock<runtime_value::MoveValue>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ModuleInfo {
+    pub doc: DocComment,
+    pub defined_loc: Loc,
     pub target_kind: TargetKind,
     pub attributes: Attributes,
     pub package: Option<Symbol>,
@@ -51,6 +61,14 @@ pub struct ModuleInfo {
     pub functions: UniqueMap<FunctionName, FunctionInfo>,
     pub constants: UniqueMap<ConstantName, ConstantInfo>,
 }
+
+#[derive(Debug, Clone)]
+pub struct ProgramInfo<const AFTER_TYPING: bool> {
+    pub modules: UniqueMap<ModuleIdent, ModuleInfo>,
+    pub sui_flavor_info: Option<SuiInfo>,
+}
+pub type NamingProgramInfo = ProgramInfo<false>;
+pub type TypingProgramInfo = ProgramInfo<true>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DatatypeKind {
@@ -66,13 +84,6 @@ pub enum NamedMemberKind {
     Constant,
 }
 
-#[derive(Debug, Clone)]
-pub struct ProgramInfo<const AFTER_TYPING: bool> {
-    pub modules: UniqueMap<ModuleIdent, ModuleInfo>,
-}
-pub type NamingProgramInfo = ProgramInfo<false>;
-pub type TypingProgramInfo = ProgramInfo<true>;
-
 macro_rules! program_info {
     ($pre_compiled_lib:ident, $prog:ident, $pass:ident, $module_use_funs:ident) => {{
         let all_modules = $prog.modules.key_cloned_iter();
@@ -80,23 +91,31 @@ macro_rules! program_info {
             let structs = mdef.structs.clone();
             let enums = mdef.enums.clone();
             let functions = mdef.functions.ref_map(|fname, fdef| FunctionInfo {
+                doc: fdef.doc.clone(),
+                index: fdef.index,
                 attributes: fdef.attributes.clone(),
                 defined_loc: fname.loc(),
+                full_loc: fdef.loc,
                 visibility: fdef.visibility.clone(),
                 entry: fdef.entry,
                 macro_: fdef.macro_,
                 signature: fdef.signature.clone(),
             });
             let constants = mdef.constants.ref_map(|cname, cdef| ConstantInfo {
+                doc: cdef.doc.clone(),
+                index: cdef.index,
                 attributes: cdef.attributes.clone(),
                 defined_loc: cname.loc(),
                 signature: cdef.signature.clone(),
+                value: OnceLock::new(),
             });
             let use_funs = $module_use_funs
                 .as_mut()
                 .map(|module_use_funs| module_use_funs.remove(&mident).unwrap())
                 .unwrap_or_default();
             let minfo = ModuleInfo {
+                doc: mdef.doc.clone(),
+                defined_loc: mdef.loc,
                 target_kind: mdef.target_kind,
                 attributes: mdef.attributes.clone(),
                 package: mdef.package_name,
@@ -118,12 +137,16 @@ macro_rules! program_info {
                 }
             }
         }
-        ProgramInfo { modules }
+        ProgramInfo {
+            modules,
+            sui_flavor_info: None,
+        }
     }};
 }
 
 impl TypingProgramInfo {
     pub fn new(
+        env: &CompilationEnv,
         pre_compiled_lib: Option<Arc<FullyCompiledProgram>>,
         modules: &UniqueMap<ModuleIdent, T::ModuleDefinition>,
         mut module_use_funs: BTreeMap<ModuleIdent, ResolvedUseFuns>,
@@ -133,7 +156,18 @@ impl TypingProgramInfo {
         }
         let mut module_use_funs = Some(&mut module_use_funs);
         let prog = Prog { modules };
-        program_info!(pre_compiled_lib, prog, typing, module_use_funs)
+        let pcl = pre_compiled_lib.clone();
+        let mut info = program_info!(pcl, prog, typing, module_use_funs);
+        // TODO we should really have an idea of root package flavor here
+        // but this feels roughly equivalent
+        if env
+            .package_configs()
+            .any(|(_, config)| config.flavor == Flavor::Sui)
+        {
+            let sui_flavor_info = SuiInfo::new(pre_compiled_lib, modules, &info);
+            info.sui_flavor_info = Some(sui_flavor_info);
+        };
+        info
     }
 }
 

@@ -30,7 +30,7 @@ const guides = [
 					'guides/developer/getting-started/local-network',
 					'guides/developer/getting-started/get-address',
 					'guides/developer/getting-started/get-coins',
-					'guides/developer/getting-started/graphql-rpc',
+					'guides/developer/getting-started/data-serving',
 				],
 			},
 			{
@@ -61,6 +61,7 @@ const guides = [
 					'guides/developer/sui-101/access-time',
 					'guides/developer/sui-101/sign-and-send-txn',
 					'guides/developer/sui-101/sponsor-txn',
+					'guides/developer/sui-101/avoid-equivocation',
 					{
 						type: 'category',
 						label: 'Working with PTBs',
@@ -85,6 +86,7 @@ const guides = [
 					'guides/developer/coin/loyalty',
 				],
 			},
+			'guides/developer/stablecoins',
 			{
 				type: 'category',
 				label: 'NFTs',
@@ -138,10 +140,12 @@ const guides = [
 						},
 						items: ['guides/developer/advanced/min-gas-fees'],
 					},*/
-					'guides/developer/advanced/graphql-migration',
 					'guides/developer/advanced/move-2024-migration',
 					'guides/developer/advanced/custom-indexer',
 					'guides/developer/advanced/randomness-onchain',
+					'guides/developer/getting-started/graphql-rpc',
+					'guides/developer/advanced/graphql-migration',
+					'guides/developer/advanced/local-fee-markets',
 				],
 			},
 			{
@@ -153,19 +157,7 @@ const guides = [
 				},
 				items: [
 					'guides/developer/app-examples/e2e-counter',
-					{
-						type: 'category',
-						label: 'Trustless Swap',
-						link: {
-							type: 'doc',
-							id: 'guides/developer/app-examples/trustless-swap',
-						},
-						items: [
-							'guides/developer/app-examples/trustless-swap/backend',
-							'guides/developer/app-examples/trustless-swap/indexer-api',
-							'guides/developer/app-examples/trustless-swap/frontend',
-						],
-					},
+					'guides/developer/app-examples/trustless-swap',
 					'guides/developer/app-examples/coin-flip',
 					'guides/developer/app-examples/reviews-rating',
 					'guides/developer/app-examples/blackjack',
@@ -204,14 +196,17 @@ const guides = [
 		items: [
 			'guides/operator/sui-full-node',
 			'guides/operator/validator-config',
+			'guides/operator/genesis',
+			'guides/operator/monitoring',
+			'guides/operator/updates',
 			'guides/operator/data-management',
 			'guides/operator/snapshots',
 			'guides/operator/archives',
-			'guides/operator/genesis',
-			'guides/operator/validator-committee',
-			'guides/operator/validator-tasks',
 			'guides/operator/node-tools',
 			'guides/operator/exchange-integration',
+			'guides/operator/bridge-node-configuration',
+			'guides/operator/validator-committee',
+			'guides/operator/validator-tasks',
 		],
 	},
 ];

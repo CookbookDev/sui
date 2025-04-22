@@ -6,12 +6,14 @@ use prometheus::Registry;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::path::PathBuf;
+use std::time::Duration;
 use sui_data_ingestion::{
-    ArchivalConfig, ArchivalWorker, BlobTaskConfig, BlobWorker, DynamoDBProgressStore,
-    KVStoreTaskConfig, KVStoreWorker,
+    ArchivalConfig, ArchivalReducer, ArchivalWorker, BlobTaskConfig, BlobWorker,
+    DynamoDBProgressStore,
 };
 use sui_data_ingestion_core::{DataIngestionMetrics, ReaderOptions};
 use sui_data_ingestion_core::{IndexerExecutor, WorkerPool};
+use sui_kvstore::{BigTableClient, BigTableProgressStore, KvWorker};
 use tokio::signal;
 use tokio::sync::oneshot;
 
@@ -20,7 +22,7 @@ use tokio::sync::oneshot;
 enum Task {
     Archival(ArchivalConfig),
     Blob(BlobTaskConfig),
-    KV(KVStoreTaskConfig),
+    BigTableKV(BigTableTaskConfig),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -40,6 +42,13 @@ struct ProgressStoreConfig {
     pub table_name: String,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct BigTableTaskConfig {
+    instance_id: String,
+    timeout_secs: usize,
+    credentials: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct IndexerConfig {
     path: PathBuf,
@@ -55,6 +64,8 @@ struct IndexerConfig {
     metrics_host: String,
     #[serde(default = "default_metrics_port")]
     metrics_port: u16,
+    #[serde(default)]
+    is_backfill: bool,
 }
 
 fn default_metrics_host() -> String {
@@ -107,21 +118,47 @@ async fn main() -> Result<()> {
     mysten_metrics::init_metrics(&registry);
     let metrics = DataIngestionMetrics::new(&registry);
 
+    let mut bigtable_store = None;
+    for task in &config.tasks {
+        if let Task::BigTableKV(kv_config) = &task.task {
+            std::env::set_var(
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                kv_config.credentials.clone(),
+            );
+            let bigtable_client = BigTableClient::new_remote(
+                kv_config.instance_id.clone(),
+                false,
+                Some(Duration::from_secs(kv_config.timeout_secs as u64)),
+                "ingestion".to_string(),
+                None,
+            )
+            .await?;
+            bigtable_store = Some(BigTableProgressStore::new(bigtable_client));
+        }
+    }
+
     let progress_store = DynamoDBProgressStore::new(
         &config.progress_store.aws_access_key_id,
         &config.progress_store.aws_secret_access_key,
         config.progress_store.aws_region,
         config.progress_store.table_name,
+        config.is_backfill,
+        bigtable_store,
     )
     .await;
     let mut executor = IndexerExecutor::new(progress_store, config.tasks.len(), metrics);
     for task_config in config.tasks {
         match task_config.task {
             Task::Archival(archival_config) => {
-                let worker_pool = WorkerPool::new(
-                    ArchivalWorker::new(archival_config).await?,
+                let reducer = ArchivalReducer::new(archival_config).await?;
+                executor
+                    .update_watermark(task_config.name.clone(), reducer.get_watermark().await?)
+                    .await?;
+                let worker_pool = WorkerPool::new_with_reducer(
+                    ArchivalWorker,
                     task_config.name,
                     task_config.concurrency,
+                    Box::new(reducer),
                 );
                 executor.register(worker_pool).await?;
             }
@@ -133,9 +170,17 @@ async fn main() -> Result<()> {
                 );
                 executor.register(worker_pool).await?;
             }
-            Task::KV(kv_config) => {
+            Task::BigTableKV(kv_config) => {
+                let client = BigTableClient::new_remote(
+                    kv_config.instance_id,
+                    false,
+                    Some(Duration::from_secs(kv_config.timeout_secs as u64)),
+                    "ingestion".to_string(),
+                    None,
+                )
+                .await?;
                 let worker_pool = WorkerPool::new(
-                    KVStoreWorker::new(kv_config).await,
+                    KvWorker { client },
                     task_config.name,
                     task_config.concurrency,
                 );

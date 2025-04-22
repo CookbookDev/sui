@@ -14,9 +14,10 @@ use crate::utils::get_eth_contract_addresses;
 use anyhow::anyhow;
 use ethers::providers::Middleware;
 use ethers::types::Address as EthAddress;
-use futures::{future, StreamExt};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
+use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -119,6 +120,9 @@ pub struct BridgeNodeConfig {
     pub metrics_key_pair: NetworkKeyPair,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metrics: Option<MetricsConfig>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub watchdog_config: Option<WatchdogConfig>,
 }
 
 pub fn default_ed25519_key_pair() -> NetworkKeyPair {
@@ -133,6 +137,13 @@ pub struct MetricsConfig {
     pub push_url: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct WatchdogConfig {
+    /// Total supplies to watch on Sui. Mapping from coin name to coin type tag
+    pub total_supplies: BTreeMap<String, String>,
+}
+
 impl Config for BridgeNodeConfig {}
 
 impl BridgeNodeConfig {
@@ -140,6 +151,7 @@ impl BridgeNodeConfig {
         &self,
         metrics: Arc<BridgeMetrics>,
     ) -> anyhow::Result<(BridgeServerConfig, Option<BridgeClientConfig>)> {
+        info!("Starting config validation");
         if !is_route_valid(
             BridgeChainId::try_from(self.sui.sui_bridge_chain_id)?,
             BridgeChainId::try_from(self.eth.eth_bridge_chain_id)?,
@@ -158,7 +170,8 @@ impl BridgeNodeConfig {
 
         // we do this check here instead of `prepare_for_sui` below because
         // that is only called when `run_client` is true.
-        let sui_client = Arc::new(SuiClient::<SuiSdkClient>::new(&self.sui.sui_rpc_url).await?);
+        let sui_client =
+            Arc::new(SuiClient::<SuiSdkClient>::new(&self.sui.sui_rpc_url, metrics.clone()).await?);
         let bridge_committee = sui_client
             .get_bridge_committee()
             .await
@@ -169,7 +182,7 @@ impl BridgeNodeConfig {
             ));
         }
 
-        let (eth_client, eth_contracts) = self.prepare_for_eth(metrics).await?;
+        let (eth_client, eth_contracts) = self.prepare_for_eth(metrics.clone()).await?;
         let bridge_summary = sui_client
             .get_bridge_summary()
             .await
@@ -196,6 +209,7 @@ impl BridgeNodeConfig {
         let bridge_server_config = BridgeServerConfig {
             key: bridge_authority_key,
             metrics_port: self.metrics_port,
+            eth_bridge_proxy_address: eth_contracts[0], // the first contract is bridge proxy
             server_listen_port: self.server_listen_port,
             sui_client: sui_client.clone(),
             eth_client: eth_client.clone(),
@@ -207,7 +221,7 @@ impl BridgeNodeConfig {
 
         // If client is enabled, prepare client config
         let (bridge_client_key, client_sui_address, gas_object_ref) =
-            self.prepare_for_sui(sui_client.clone()).await?;
+            self.prepare_for_sui(sui_client.clone(), metrics).await?;
 
         let db_path = self
             .db_path
@@ -234,6 +248,7 @@ impl BridgeNodeConfig {
                 .sui_bridge_module_last_processed_event_id_override,
         };
 
+        info!("Config validation complete");
         Ok((bridge_server_config, Some(bridge_client_config)))
     }
 
@@ -241,6 +256,7 @@ impl BridgeNodeConfig {
         &self,
         metrics: Arc<BridgeMetrics>,
     ) -> anyhow::Result<(Arc<EthClient<MeteredEthHttpProvier>>, Vec<EthAddress>)> {
+        info!("Creating Ethereum client provider");
         let bridge_proxy_address = EthAddress::from_str(&self.eth.eth_bridge_proxy_address)?;
         let provider = Arc::new(
             new_metered_eth_provider(&self.eth.eth_rpc_url, metrics.clone())
@@ -248,8 +264,16 @@ impl BridgeNodeConfig {
                 .interval(std::time::Duration::from_millis(2000)),
         );
         let chain_id = provider.get_chainid().await?;
-        let (committee_address, limiter_address, vault_address, config_address) =
-            get_eth_contract_addresses(bridge_proxy_address, &provider).await?;
+        let (
+            committee_address,
+            limiter_address,
+            vault_address,
+            config_address,
+            _weth_address,
+            _usdt_address,
+            _wbtc_address,
+            _lbtc_address,
+        ) = get_eth_contract_addresses(bridge_proxy_address, &provider).await?;
         let config = EthBridgeConfig::new(config_address, provider.clone());
 
         if self.run_client && self.eth.eth_contracts_start_block_fallback.is_none() {
@@ -307,12 +331,14 @@ impl BridgeNodeConfig {
             limiter_address,
             vault_address,
         ];
+        info!("Ethereum client setup complete");
         Ok((eth_client, contract_addresses))
     }
 
     async fn prepare_for_sui(
         &self,
         sui_client: Arc<SuiClient<SuiSdkClient>>,
+        metrics: Arc<BridgeMetrics>,
     ) -> anyhow::Result<(SuiKeyPair, SuiAddress, ObjectRef)> {
         let bridge_client_key = match &self.sui.bridge_client_key_path {
             None => read_key(&self.bridge_authority_key_path, true),
@@ -350,15 +376,16 @@ impl BridgeNodeConfig {
 
         let client_sui_address = SuiAddress::from(&bridge_client_key.public());
 
-        // TODO: decide a minimal amount here
         let gas_object_id = match self.sui.bridge_client_gas_object {
             Some(id) => id,
             None => {
+                info!("No gas object configured, finding gas object with highest balance");
                 let sui_client = SuiClientBuilder::default()
                     .build(&self.sui.sui_rpc_url)
                     .await?;
                 let coin =
-                    pick_highest_balance_coin(sui_client.coin_read_api(), client_sui_address, 0)
+                    // Minimum balance for gas object is 10 SUI
+                    pick_highest_balance_coin(sui_client.coin_read_api(), client_sui_address, 10_000_000_000)
                         .await?;
                 coin.coin_object_id
             }
@@ -369,13 +396,11 @@ impl BridgeNodeConfig {
         if owner != Owner::AddressOwner(client_sui_address) {
             return Err(anyhow!("Gas object {:?} is not owned by bridge client key's associated sui address {:?}, but {:?}", gas_object_id, client_sui_address, owner));
         }
-        info!(
-            "Starting bridge client with address: {:?}, gas object {:?}, balance: {}",
-            client_sui_address,
-            gas_object_ref.0,
-            gas_coin.value()
-        );
+        let balance = gas_coin.value();
+        info!("Gas object balance: {}", balance);
+        metrics.gas_coin_balance.set(balance as i64);
 
+        info!("Sui client setup complete");
         Ok((bridge_client_key, client_sui_address, gas_object_ref))
     }
 }
@@ -383,6 +408,7 @@ impl BridgeNodeConfig {
 pub struct BridgeServerConfig {
     pub key: BridgeAuthorityKeyPair,
     pub server_listen_port: u16,
+    pub eth_bridge_proxy_address: EthAddress,
     pub metrics_port: u16,
     pub sui_client: Arc<SuiClient<SuiSdkClient>>,
     pub eth_client: Arc<EthClient<MeteredEthHttpProvier>>,
@@ -390,7 +416,6 @@ pub struct BridgeServerConfig {
     pub approved_governance_actions: Vec<BridgeAction>,
 }
 
-// TODO: add gas balance alert threshold
 pub struct BridgeClientConfig {
     pub sui_address: SuiAddress,
     pub key: SuiKeyPair,
@@ -420,29 +445,43 @@ pub async fn pick_highest_balance_coin(
     address: SuiAddress,
     minimal_amount: u64,
 ) -> anyhow::Result<Coin> {
-    let mut highest_balance = 0;
-    let mut highest_balance_coin = None;
-    coin_read_api
-        .get_coins_stream(address, None)
-        .for_each(|coin: Coin| {
-            if coin.balance > highest_balance {
-                highest_balance = coin.balance;
-                highest_balance_coin = Some(coin.clone());
-            }
-            future::ready(())
-        })
-        .await;
-    if highest_balance_coin.is_none() {
-        return Err(anyhow!("No Sui coins found for address {:?}", address));
+    info!("Looking for a suitable gas coin for address {:?}", address);
+
+    // Only look at SUI coins specifically
+    let mut stream = coin_read_api
+        .get_coins_stream(address, Some("0x2::sui::SUI".to_string()))
+        .boxed();
+
+    let mut coins_checked = 0;
+
+    while let Some(coin) = stream.next().await {
+        info!(
+            "Checking coin: {:?}, balance: {}",
+            coin.coin_object_id, coin.balance
+        );
+        coins_checked += 1;
+
+        // Take the first coin with a sufficient balance
+        if coin.balance >= minimal_amount {
+            info!(
+                "Found suitable gas coin with {} mist (object ID: {:?})",
+                coin.balance, coin.coin_object_id
+            );
+            return Ok(coin);
+        }
+
+        // Only check a small number of coins before giving up
+        if coins_checked >= 1000 {
+            break;
+        }
     }
-    if highest_balance < minimal_amount {
-        return Err(anyhow!(
-            "Found no single coin that has >= {} balance Sui for address {:?}",
-            minimal_amount,
-            address,
-        ));
-    }
-    Ok(highest_balance_coin.unwrap())
+
+    Err(anyhow!(
+        "No suitable gas coin with >= {} mist found for address {:?} after checking {} coins",
+        minimal_amount,
+        address,
+        coins_checked
+    ))
 }
 
 #[derive(Debug, Eq, PartialEq, Clone)]

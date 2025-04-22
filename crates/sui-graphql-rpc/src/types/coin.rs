@@ -174,8 +174,8 @@ impl Coin {
     }
 
     /// The owner type of this object: Immutable, Shared, Parent, Address
-    pub(crate) async fn owner(&self, ctx: &Context<'_>) -> Option<ObjectOwner> {
-        ObjectImpl(&self.super_.super_).owner(ctx).await
+    pub(crate) async fn owner(&self) -> Option<ObjectOwner> {
+        ObjectImpl(&self.super_.super_).owner().await
     }
 
     /// The transaction block that created this version of the object.
@@ -435,7 +435,7 @@ fn apply_filter(mut query: RawQuery, coin_type: &TypeTag, owner: Option<SuiAddre
 
     query = filter!(
         query,
-        "coin_type IS NOT NULL AND coin_type = {}",
+        "coin_type IS NOT NULL AND coin_type = {} AND object_status = 0",
         coin_type.to_canonical_display(/* with_prefix */ true)
     );
 

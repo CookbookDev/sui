@@ -9,6 +9,7 @@ use std::fmt;
 pub mod binary_config;
 pub mod check_bounds;
 pub mod compatibility;
+pub mod compatibility_mode;
 #[macro_use]
 pub mod errors;
 pub mod constant;
@@ -21,6 +22,7 @@ pub mod normalized;
 pub mod proptest_types;
 pub mod serializer;
 
+pub mod inclusion_mode;
 #[cfg(test)]
 mod unit_tests;
 

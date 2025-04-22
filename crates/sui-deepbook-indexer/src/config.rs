@@ -10,13 +10,14 @@ pub struct IndexerConfig {
     pub remote_store_url: String,
     #[serde(default = "default_db_url")]
     pub db_url: String,
-    pub checkpoints_path: String,
+    /// Only provide this if you use a colocated FN
+    pub checkpoints_path: Option<String>,
     pub sui_rpc_url: String,
     pub deepbook_package_id: String,
     pub deepbook_genesis_checkpoint: u64,
     pub concurrency: u64,
     pub metric_port: u16,
-    pub resume_from_checkpoint: Option<u64>,
+    pub service_port: u16,
 }
 
 impl sui_config::Config for IndexerConfig {}

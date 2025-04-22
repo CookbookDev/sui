@@ -4,6 +4,7 @@
 use std::{sync::Arc, time::Duration};
 
 use fastcrypto::traits::KeyPair;
+use futures::FutureExt;
 use mysten_metrics::RegistryService;
 use prometheus::Registry;
 use sui_swarm_config::network_config_builder::ConfigBuilder;
@@ -15,6 +16,7 @@ use tokio::{sync::mpsc, time::sleep};
 use crate::{
     authority::{test_authority_builder::TestAuthorityBuilder, AuthorityState},
     checkpoints::{CheckpointMetrics, CheckpointService, CheckpointServiceNoop},
+    consensus_adapter::NoopConsensusOverloadChecker,
     consensus_handler::ConsensusHandlerInitializer,
     consensus_manager::{
         mysticeti_manager::MysticetiManager, ConsensusManagerMetrics, ConsensusManagerTrait,
@@ -29,11 +31,10 @@ pub fn checkpoint_service_for_testing(state: Arc<AuthorityState>) -> Arc<Checkpo
     let epoch_store = state.epoch_store_for_testing();
     let accumulator = Arc::new(StateAccumulator::new_for_tests(
         state.get_accumulator_store().clone(),
-        &epoch_store,
     ));
     let (certified_output, _certified_result) = mpsc::channel::<CertifiedCheckpointSummary>(10);
 
-    let (checkpoint_service, _) = CheckpointService::spawn(
+    let checkpoint_service = CheckpointService::build(
         state.clone(),
         state.get_checkpoint_store().clone(),
         epoch_store.clone(),
@@ -45,6 +46,7 @@ pub fn checkpoint_service_for_testing(state: Arc<AuthorityState>) -> Arc<Checkpo
         3,
         100_000,
     );
+    checkpoint_service.spawn().now_or_never().unwrap();
     checkpoint_service
 }
 
@@ -52,7 +54,7 @@ pub fn checkpoint_service_for_testing(state: Arc<AuthorityState>) -> Arc<Checkpo
 async fn test_mysticeti_manager() {
     // GIVEN
     let configs = ConfigBuilder::new_with_temp_dir()
-        .committee_size(1.try_into().unwrap())
+        .committee_size(4.try_into().unwrap())
         .build();
 
     let config = &configs.validator_configs()[0];
@@ -96,7 +98,8 @@ async fn test_mysticeti_manager() {
                 epoch_store.clone(),
                 consensus_handler_initializer,
                 SuiTxValidator::new(
-                    epoch_store.clone(),
+                    state.clone(),
+                    Arc::new(NoopConsensusOverloadChecker {}),
                     Arc::new(CheckpointServiceNoop {}),
                     state.transaction_manager().clone(),
                     SuiTxValidatorMetrics::new(&Registry::new()),
@@ -107,16 +110,30 @@ async fn test_mysticeti_manager() {
         // THEN
         assert!(manager.is_running().await);
 
+        let boot_counter = *manager.boot_counter.lock().await;
+        if i == 1 || i == 2 {
+            assert_eq!(boot_counter, 0);
+        } else {
+            assert_eq!(boot_counter, 1);
+        }
+
         // Now try to shut it down
         sleep(Duration::from_secs(1)).await;
+
+        // Simulate a commit by bumping the handled commit index so we can ensure that boot counter increments only after the first run.
+        // Practically we want to simulate a case where consensus engine restarts when no commits have happened before for first run.
+        if i > 1 {
+            let monitor = manager
+                .consumer_monitor
+                .load_full()
+                .expect("A consumer monitor should have been initialised");
+            monitor.set_highest_handled_commit(100);
+        }
 
         // WHEN
         manager.shutdown().await;
 
         // THEN
         assert!(!manager.is_running().await);
-
-        let boot_counter = *manager.boot_counter.lock().await;
-        assert_eq!(boot_counter, i);
     }
 }

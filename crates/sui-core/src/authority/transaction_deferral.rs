@@ -1,9 +1,8 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use narwhal_types::Round;
 use serde::{Deserialize, Serialize};
-use sui_types::base_types::ObjectID;
+use sui_types::{base_types::ObjectID, messages_consensus::Round};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum DeferralKey {
@@ -101,12 +100,9 @@ pub fn transaction_deferral_within_limit(
 #[cfg(test)]
 mod object_cost_tests {
     use super::*;
+    use typed_store::rocks::{DBMap, MetricConf};
     use typed_store::DBMapUtils;
     use typed_store::Map;
-    use typed_store::{
-        rocks::{DBMap, MetricConf},
-        traits::{TableSummary, TypedStoreDebug},
-    };
 
     #[tokio::test]
     async fn test_deferral_key_sort_order() {
@@ -136,8 +132,8 @@ mod object_cost_tests {
         }
 
         let mut previous_future_round = 0;
-        for (key, _) in db.deferred_certs.unbounded_iter() {
-            match key {
+        for item in db.deferred_certs.safe_iter() {
+            match item.unwrap().0 {
                 DeferralKey::Randomness { .. } => (),
                 DeferralKey::ConsensusRound { future_round, .. } => {
                     assert!(previous_future_round <= future_round);

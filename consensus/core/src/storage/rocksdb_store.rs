@@ -15,7 +15,7 @@ use typed_store::{
 
 use super::{CommitInfo, Store, WriteBatch};
 use crate::{
-    block::{BlockAPI as _, BlockDigest, BlockRef, Round, SignedBlock, Slot, VerifiedBlock},
+    block::{BlockAPI as _, BlockDigest, BlockRef, Round, SignedBlock, VerifiedBlock},
     commit::{CommitAPI as _, CommitDigest, CommitIndex, CommitRange, CommitRef, TrustedCommit},
     error::{ConsensusError, ConsensusResult},
 };
@@ -54,10 +54,9 @@ impl RocksDBStore {
             (
                 Self::BLOCKS_CF,
                 default_db_options()
-                    .optimize_for_write_throughput()
-                    // Blocks can get large and they don't need to be compacted.
-                    // So keep them in rocksdb blobstore.
-                    .optimize_for_large_values_no_scan(1 << 10)
+                    .optimize_for_write_throughput_no_deletion()
+                    // Using larger block is ok since there is not much point reads on the cf.
+                    .set_block_options(512, 128 << 10)
                     .options,
             ),
             (Self::DIGESTS_BY_AUTHORITIES_CF, cf_options.clone()),
@@ -178,18 +177,6 @@ impl Store for RocksDBStore {
         Ok(exist)
     }
 
-    fn contains_block_at_slot(&self, slot: Slot) -> ConsensusResult<bool> {
-        let found = self
-            .digests_by_authorities
-            .safe_range_iter((
-                Included((slot.authority, slot.round, BlockDigest::MIN)),
-                Included((slot.authority, slot.round, BlockDigest::MAX)),
-            ))
-            .next()
-            .is_some();
-        Ok(found)
-    }
-
     fn scan_blocks_by_author(
         &self,
         author: AuthorityIndex,
@@ -226,12 +213,10 @@ impl Store for RocksDBStore {
         let mut refs = VecDeque::new();
         for kv in self
             .digests_by_authorities
-            .safe_range_iter((
-                Included((author, Round::MIN, BlockDigest::MIN)),
-                Included((author, before_round, BlockDigest::MAX)),
-            ))
-            .skip_to_last()
-            .reverse()
+            .reversed_safe_iter_with_bounds(
+                Some((author, Round::MIN, BlockDigest::MIN)),
+                Some((author, before_round, BlockDigest::MAX)),
+            )?
             .take(num_of_rounds as usize)
         {
             let ((author, round, digest), _) = kv?;
@@ -248,7 +233,11 @@ impl Store for RocksDBStore {
     }
 
     fn read_last_commit(&self) -> ConsensusResult<Option<TrustedCommit>> {
-        let Some(result) = self.commits.safe_iter().skip_to_last().next() else {
+        let Some(result) = self
+            .commits
+            .reversed_safe_iter_with_bounds(None, None)?
+            .next()
+        else {
             return Ok(None);
         };
         let ((_index, digest), serialized) = result?;
@@ -290,7 +279,11 @@ impl Store for RocksDBStore {
     }
 
     fn read_last_commit_info(&self) -> ConsensusResult<Option<(CommitRef, CommitInfo)>> {
-        let Some(result) = self.commit_info.safe_iter().skip_to_last().next() else {
+        let Some(result) = self
+            .commit_info
+            .reversed_safe_iter_with_bounds(None, None)?
+            .next()
+        else {
             return Ok(None);
         };
         let (key, commit_info) = result.map_err(ConsensusError::RocksDBFailure)?;

@@ -32,7 +32,7 @@ async fn test_simple_client_validator_cluster() {
     let cluster = start_cluster(ServiceConfig::test_defaults()).await;
 
     cluster
-        .wait_for_checkpoint_catchup(1, Duration::from_secs(10))
+        .wait_for_checkpoint_catchup(1, Duration::from_secs(30))
         .await;
 
     let query = r#"
@@ -91,7 +91,7 @@ async fn test_simple_client_simulator_cluster() {
     )
     .await;
     cluster
-        .wait_for_checkpoint_catchup(1, Duration::from_secs(10))
+        .wait_for_checkpoint_catchup(1, Duration::from_secs(30))
         .await;
 
     let query = r#"
@@ -277,8 +277,6 @@ async fn test_graphql_client_variables() {
 
 #[tokio::test]
 async fn test_transaction_execution() {
-    telemetry_subscribers::init_for_testing();
-
     let cluster = start_cluster(ServiceConfig::test_defaults()).await;
 
     let addresses = cluster
@@ -393,6 +391,7 @@ async fn test_zklogin_sig_verify() {
     let cluster = start_cluster(ServiceConfig::test_defaults()).await;
 
     let test_cluster = &cluster.network.validator_fullnode_handle;
+    test_cluster.trigger_reconfiguration().await;
     test_cluster.wait_for_epoch_all_nodes(1).await;
     test_cluster.wait_for_authenticator_state_update().await;
 
@@ -454,7 +453,6 @@ async fn test_zklogin_sig_verify() {
 
     // a valid signature with tx bytes returns success as true.
     let binding = res.response_body().data.clone().into_json().unwrap();
-    tracing::info!("tktkbinding: {:?}", binding);
     let res = binding.get("verifyZkloginSignature").unwrap();
     assert_eq!(res.get("success").unwrap(), true);
 
@@ -746,7 +744,7 @@ async fn test_dry_run_failed_execution() {
 }
 
 #[tokio::test]
-async fn test_epoch_data() {
+async fn test_epoch_live_object_set_digest() {
     telemetry_subscribers::init_for_testing();
 
     let cluster = start_cluster(ServiceConfig::test_defaults()).await;
@@ -758,7 +756,9 @@ async fn test_epoch_data() {
         .await;
 
     // Wait for the epoch to be indexed
-    sleep(Duration::from_secs(10)).await;
+    cluster
+        .wait_for_epoch_catchup(0, Duration::from_secs(30))
+        .await;
 
     // Query the epoch
     let query = "

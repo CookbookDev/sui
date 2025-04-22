@@ -12,6 +12,7 @@ use serde_json::json;
 use shared_crypto::intent::Intent;
 use signature::rand_core::OsRng;
 use std::collections::{BTreeMap, HashMap};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::str::FromStr;
 use sui_json_rpc_types::SuiTransactionBlockResponseOptions;
@@ -656,7 +657,7 @@ fn find_module_object(
             {
                 if type_pred(object_type) {
                     return Some(OwnedObjectRef {
-                        owner: *owner,
+                        owner: owner.clone(),
                         reference: SuiObjectRef {
                             object_id: *object_id,
                             version: *version,
@@ -750,7 +751,7 @@ async fn test_transaction(
             SuiExecutionStatus::Failure { .. }
         ));
     }
-    let coin_cache = CoinMetadataCache::new(client.clone());
+    let coin_cache = CoinMetadataCache::new(client.clone(), NonZeroUsize::new(2).unwrap());
     let ops = Operations::try_from_response(response.clone(), &coin_cache)
         .await
         .unwrap();

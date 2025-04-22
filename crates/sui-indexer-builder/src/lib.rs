@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod indexer_builder;
+pub mod metrics;
 pub mod progress;
-
+pub mod sui_datasource;
 pub const LIVE_TASK_TARGET_CHECKPOINT: i64 = i64::MAX;
 
 #[derive(Clone, Debug)]
@@ -13,6 +14,21 @@ pub struct Task {
     pub target_checkpoint: u64,
     pub timestamp: u64,
     pub is_live_task: bool,
+}
+
+impl Task {
+    // TODO: this is really fragile and we should fix the task naming thing and storage schema asasp
+    pub fn name_prefix(&self) -> &str {
+        self.task_name.split(' ').next().unwrap_or("Unknown")
+    }
+
+    pub fn type_str(&self) -> &str {
+        if self.is_live_task {
+            "live"
+        } else {
+            "backfill"
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

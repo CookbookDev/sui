@@ -16,10 +16,10 @@ use std::{
 use sui_types::traffic_control::{PolicyConfig, RemoteFirewallConfig};
 
 use sui_config::node::{AuthorityOverloadConfig, DBCheckpointConfig, RunWithRange};
-use sui_config::NodeConfig;
+use sui_config::{ExecutionCacheConfig, NodeConfig};
 use sui_macros::nondeterministic;
 use sui_node::SuiNodeHandle;
-use sui_protocol_config::ProtocolVersion;
+use sui_protocol_config::{Chain, ProtocolVersion};
 use sui_swarm_config::genesis_config::{AccountConfig, GenesisConfig, ValidatorGenesisConfig};
 use sui_swarm_config::network_config::NetworkConfig;
 use sui_swarm_config::network_config_builder::{
@@ -40,6 +40,7 @@ pub struct SwarmBuilder<R = OsRng> {
     committee: CommitteeConfig,
     genesis_config: Option<GenesisConfig>,
     network_config: Option<NetworkConfig>,
+    chain_override: Option<Chain>,
     additional_objects: Vec<Object>,
     fullnode_count: usize,
     fullnode_rpc_port: Option<u16>,
@@ -51,6 +52,7 @@ pub struct SwarmBuilder<R = OsRng> {
     jwk_fetch_interval: Option<Duration>,
     num_unpruned_validators: Option<usize>,
     authority_overload_config: Option<AuthorityOverloadConfig>,
+    execution_cache_config: Option<ExecutionCacheConfig>,
     data_ingestion_dir: Option<PathBuf>,
     fullnode_run_with_range: Option<RunWithRange>,
     fullnode_policy_config: Option<PolicyConfig>,
@@ -58,6 +60,7 @@ pub struct SwarmBuilder<R = OsRng> {
     max_submit_position: Option<usize>,
     submit_delay_step_override_millis: Option<u64>,
     state_accumulator_v2_enabled_config: StateAccumulatorV2EnabledConfig,
+    disable_fullnode_pruning: bool,
 }
 
 impl SwarmBuilder {
@@ -69,6 +72,7 @@ impl SwarmBuilder {
             committee: CommitteeConfig::Size(NonZeroUsize::new(1).unwrap()),
             genesis_config: None,
             network_config: None,
+            chain_override: None,
             additional_objects: vec![],
             fullnode_count: 0,
             fullnode_rpc_port: None,
@@ -79,6 +83,7 @@ impl SwarmBuilder {
             jwk_fetch_interval: None,
             num_unpruned_validators: None,
             authority_overload_config: None,
+            execution_cache_config: None,
             data_ingestion_dir: None,
             fullnode_run_with_range: None,
             fullnode_policy_config: None,
@@ -86,6 +91,7 @@ impl SwarmBuilder {
             max_submit_position: None,
             submit_delay_step_override_millis: None,
             state_accumulator_v2_enabled_config: StateAccumulatorV2EnabledConfig::Global(true),
+            disable_fullnode_pruning: false,
         }
     }
 }
@@ -98,6 +104,7 @@ impl<R> SwarmBuilder<R> {
             committee: self.committee,
             genesis_config: self.genesis_config,
             network_config: self.network_config,
+            chain_override: self.chain_override,
             additional_objects: self.additional_objects,
             fullnode_count: self.fullnode_count,
             fullnode_rpc_port: self.fullnode_rpc_port,
@@ -109,6 +116,7 @@ impl<R> SwarmBuilder<R> {
             jwk_fetch_interval: self.jwk_fetch_interval,
             num_unpruned_validators: self.num_unpruned_validators,
             authority_overload_config: self.authority_overload_config,
+            execution_cache_config: self.execution_cache_config,
             data_ingestion_dir: self.data_ingestion_dir,
             fullnode_run_with_range: self.fullnode_run_with_range,
             fullnode_policy_config: self.fullnode_policy_config,
@@ -116,6 +124,7 @@ impl<R> SwarmBuilder<R> {
             max_submit_position: self.max_submit_position,
             submit_delay_step_override_millis: self.submit_delay_step_override_millis,
             state_accumulator_v2_enabled_config: self.state_accumulator_v2_enabled_config,
+            disable_fullnode_pruning: self.disable_fullnode_pruning,
         }
     }
 
@@ -145,6 +154,12 @@ impl<R> SwarmBuilder<R> {
     pub fn with_genesis_config(mut self, genesis_config: GenesisConfig) -> Self {
         assert!(self.network_config.is_none() && self.genesis_config.is_none());
         self.genesis_config = Some(genesis_config);
+        self
+    }
+
+    pub fn with_chain_override(mut self, chain: Chain) -> Self {
+        assert!(self.chain_override.is_none());
+        self.chain_override = Some(chain);
         self
     }
 
@@ -254,6 +269,14 @@ impl<R> SwarmBuilder<R> {
         self
     }
 
+    pub fn with_execution_cache_config(
+        mut self,
+        execution_cache_config: ExecutionCacheConfig,
+    ) -> Self {
+        self.execution_cache_config = Some(execution_cache_config);
+        self
+    }
+
     pub fn with_data_ingestion_dir(mut self, path: PathBuf) -> Self {
         self.data_ingestion_dir = Some(path);
         self
@@ -289,6 +312,11 @@ impl<R> SwarmBuilder<R> {
         self
     }
 
+    pub fn with_disable_fullnode_pruning(mut self) -> Self {
+        self.disable_fullnode_pruning = true;
+        self
+    }
+
     pub fn with_submit_delay_step_override_millis(
         mut self,
         submit_delay_step_override_millis: u64,
@@ -316,6 +344,10 @@ impl<R: rand::RngCore + rand::CryptoRng> SwarmBuilder<R> {
                 config_builder = config_builder.with_genesis_config(genesis_config);
             }
 
+            if let Some(chain_override) = self.chain_override {
+                config_builder = config_builder.with_chain_override(chain_override);
+            }
+
             if let Some(num_unpruned_validators) = self.num_unpruned_validators {
                 config_builder =
                     config_builder.with_num_unpruned_validators(num_unpruned_validators);
@@ -328,6 +360,10 @@ impl<R: rand::RngCore + rand::CryptoRng> SwarmBuilder<R> {
             if let Some(authority_overload_config) = self.authority_overload_config {
                 config_builder =
                     config_builder.with_authority_overload_config(authority_overload_config);
+            }
+
+            if let Some(execution_cache_config) = self.execution_cache_config {
+                config_builder = config_builder.with_execution_cache_config(execution_cache_config);
             }
 
             if let Some(path) = self.data_ingestion_dir {
@@ -375,7 +411,12 @@ impl<R: rand::RngCore + rand::CryptoRng> SwarmBuilder<R> {
             .with_run_with_range(self.fullnode_run_with_range)
             .with_policy_config(self.fullnode_policy_config)
             .with_data_ingestion_dir(ingest_data)
-            .with_fw_config(self.fullnode_fw_config);
+            .with_fw_config(self.fullnode_fw_config)
+            .with_disable_pruning(self.disable_fullnode_pruning);
+
+        if let Some(chain) = self.chain_override {
+            fullnode_config_builder = fullnode_config_builder.with_chain_override(chain);
+        }
 
         if let Some(spvc) = &self.fullnode_supported_protocol_versions_config {
             let supported_versions = match spvc {
@@ -496,7 +537,7 @@ impl Swarm {
     /// Returns an iterator over all currently active validators.
     pub fn active_validators(&self) -> impl Iterator<Item = &Node> {
         self.validator_nodes().filter(|node| {
-            node.get_node_handle().map_or(false, |handle| {
+            node.get_node_handle().is_some_and(|handle| {
                 let state = handle.state();
                 state.is_validator(&state.epoch_store_for_testing())
             })

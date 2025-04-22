@@ -64,15 +64,11 @@ impl EpochPartitionData {
     pub fn compose_data(epoch: EpochToCommit, last_db_epoch: StoredEpochInfo) -> Self {
         let last_epoch = last_db_epoch.epoch as u64;
         let last_epoch_start_cp = last_db_epoch.first_checkpoint_id as u64;
-        let next_epoch = epoch.new_epoch.epoch;
-        let next_epoch_start_cp = epoch.new_epoch.first_checkpoint_id;
-
-        // Determining the tx_sequence_number range for the epoch partition differs from the
-        // checkpoint_sequence_number range, because the former is a sum of total transactions -
-        // this sum already addresses the off-by-one.
-        let next_epoch_start_tx = epoch.network_total_transactions;
+        let next_epoch = epoch.new_epoch_id();
+        let next_epoch_start_cp = epoch.new_epoch_first_checkpoint_id();
+        let next_epoch_start_tx = epoch.new_epoch_first_tx_sequence_number();
         let last_epoch_start_tx =
-            next_epoch_start_tx - last_db_epoch.epoch_total_transactions.unwrap() as u64;
+            next_epoch_start_tx - epoch.last_epoch_total_transactions().unwrap();
 
         Self {
             last_epoch,
@@ -168,16 +164,14 @@ impl PgPartitionManager {
             transaction_with_retry(&self.pool, Duration::from_secs(10), |conn| {
                 async {
                     diesel_async::RunQueryDsl::execute(
-                        diesel::sql_query("CALL advance_partition($1, $2, $3, $4, $5)")
+                        diesel::sql_query("CALL robust_advance_partition($1, $2, $3, $4)")
                             .bind::<diesel::sql_types::Text, _>(table.clone())
                             .bind::<diesel::sql_types::BigInt, _>(data.last_epoch as i64)
                             .bind::<diesel::sql_types::BigInt, _>(data.next_epoch as i64)
-                            .bind::<diesel::sql_types::BigInt, _>(partition_range.0 as i64)
                             .bind::<diesel::sql_types::BigInt, _>(partition_range.1 as i64),
                         conn,
                     )
                     .await?;
-
                     Ok(())
                 }
                 .scope_boxed()

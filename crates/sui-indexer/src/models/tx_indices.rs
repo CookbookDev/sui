@@ -3,12 +3,13 @@
 
 use crate::{
     schema::{
-        tx_calls_fun, tx_calls_mod, tx_calls_pkg, tx_changed_objects, tx_digests, tx_input_objects,
-        tx_kinds, tx_recipients, tx_senders,
+        tx_affected_addresses, tx_affected_objects, tx_calls_fun, tx_calls_mod, tx_calls_pkg,
+        tx_changed_objects, tx_digests, tx_input_objects, tx_kinds,
     },
     types::TxIndex,
 };
 use diesel::prelude::*;
+use itertools::Itertools;
 
 #[derive(QueryableByName)]
 pub struct TxSequenceNumber {
@@ -23,17 +24,18 @@ pub struct TxDigest {
 }
 
 #[derive(Queryable, Insertable, Selectable, Debug, Clone, Default)]
-#[diesel(table_name = tx_senders)]
-pub struct StoredTxSenders {
+#[diesel(table_name = tx_affected_addresses)]
+pub struct StoredTxAffectedAddresses {
     pub tx_sequence_number: i64,
+    pub affected: Vec<u8>,
     pub sender: Vec<u8>,
 }
 
 #[derive(Queryable, Insertable, Selectable, Debug, Clone, Default)]
-#[diesel(table_name = tx_recipients)]
-pub struct StoredTxRecipients {
+#[diesel(table_name = tx_affected_objects)]
+pub struct StoredTxAffectedObjects {
     pub tx_sequence_number: i64,
-    pub recipient: Vec<u8>,
+    pub affected: Vec<u8>,
     pub sender: Vec<u8>,
 }
 
@@ -99,8 +101,8 @@ impl TxIndex {
     pub fn split(
         self: TxIndex,
     ) -> (
-        Vec<StoredTxSenders>,
-        Vec<StoredTxRecipients>,
+        Vec<StoredTxAffectedAddresses>,
+        Vec<StoredTxAffectedObjects>,
         Vec<StoredTxInputObject>,
         Vec<StoredTxChangedObject>,
         Vec<StoredTxPkg>,
@@ -110,19 +112,30 @@ impl TxIndex {
         Vec<StoredTxKind>,
     ) {
         let tx_sequence_number = self.tx_sequence_number as i64;
-        let tx_sender = StoredTxSenders {
-            tx_sequence_number,
-            sender: self.sender.to_vec(),
-        };
-        let tx_recipients = self
+
+        let tx_affected_addresses = self
             .recipients
             .iter()
-            .map(|s| StoredTxRecipients {
+            .chain(self.payers.iter())
+            .chain(std::iter::once(&self.sender))
+            .unique()
+            .map(|a| StoredTxAffectedAddresses {
                 tx_sequence_number,
-                recipient: s.to_vec(),
+                affected: a.to_vec(),
                 sender: self.sender.to_vec(),
             })
             .collect();
+
+        let tx_affected_objects = self
+            .affected_objects
+            .iter()
+            .map(|o| StoredTxAffectedObjects {
+                tx_sequence_number,
+                affected: o.to_vec(),
+                sender: self.sender.to_vec(),
+            })
+            .collect();
+
         let tx_input_objects = self
             .input_objects
             .iter()
@@ -132,6 +145,7 @@ impl TxIndex {
                 sender: self.sender.to_vec(),
             })
             .collect();
+
         let tx_changed_objects = self
             .changed_objects
             .iter()
@@ -197,8 +211,8 @@ impl TxIndex {
         };
 
         (
-            vec![tx_sender],
-            tx_recipients,
+            tx_affected_addresses,
+            tx_affected_objects,
             tx_input_objects,
             tx_changed_objects,
             tx_pkgs,

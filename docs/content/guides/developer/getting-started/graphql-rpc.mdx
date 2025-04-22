@@ -1,7 +1,15 @@
 ---
-title: Querying Sui RPC with GraphQL
-description: Intoductory guide to making queries of the Sui RPC using the GraphQL service.
+title: Querying Sui RPC with GraphQL (Alpha)
+description: Introductory guide to making queries of the Sui RPC using the GraphQL service.
 ---
+
+:::info
+
+{@include: ../../../snippets/data-serving-msg.mdx}
+
+{@include: ../../../snippets/data-serving-gql-alpha.mdx}
+
+:::
 
 The quickest way to access the GraphQL service for Sui RPC is through the online IDE that provides a complete toolbox for fetching data and executing transactions on the network. The online IDE provides features such as auto-completion (use Ctrl+Space or just start typing), built-in documentation (Book icon, top-left), multi-tabs, and more.
 
@@ -161,7 +169,7 @@ This example finds the balance changes of all the transactions where a given add
 query ($address: SuiAddress!) {
   transactionBlocks(filter: {
     function: "0x3::sui_system::request_add_stake"
-    signAddress: $address
+    sentAddress: $address
   }) {
     nodes {
       digest
@@ -242,7 +250,7 @@ fragment MoveValueFields on MoveValue {
 
 ## Fetching all dynamic fields on an object
 
-This query can be used to paginate over the dynamic fields of an object. This works even when the object in question is [wrapped](../../../concepts/object-ownership/wrapped.mdx), by using the <a href="/references/sui-api/sui-graphql/reference/queries/owner" data-noBrokenLinkCheck='true'>owner</a> query, so can be used for iterating over the elements of on-chain data structures, like [Tables and Bags](../../../concepts/dynamic-fields/tables-bags.mdx).
+This query can be used to paginate over the dynamic fields of an object. This works even when the object in question is [wrapped](../../../concepts/object-ownership/wrapped.mdx), by using the <a href="/references/sui-api/sui-graphql/reference/queries/owner" data-noBrokenLinkCheck='true'>owner</a> query, so can be used for iterating over the elements of on-chain data structures, like tables and bags. See [The Move Book](https://move-book.com/programmability/dynamic-collections.html) to learn more about dynamic collections available in Move.
 
 :::info
 This example uses [fragments](../../../concepts/graphql-rpc.mdx#fragments) and [variables](../../../concepts/graphql-rpc.mdx#variables).
@@ -370,7 +378,7 @@ Examples in the repository are designed to work with the version of GraphQL buil
 ## Related links
 
 - [GraphQL migration](../advanced/graphql-migration.mdx): Migrating to GraphQL guides you through migrating Sui RPC projects from JSON-RPC to GraphQL.
-- [GraphQL concepts](../../../concepts/graphql-rpc.mdx): GraphQL for Sui RPC examines the elements of GraphQL that you should know to get the most from the service.  
+- [GraphQL concepts](../../../concepts/graphql-rpc.mdx): GraphQL for Sui RPC examines the elements of GraphQL that you should know to get the most from the service.
 - [GraphQL reference](../../../references/sui-graphql.mdx): Auto-generated GraphQL reference for Sui RPC.
-- [Sui Testnet GraphiQL](https://sui-testnet.mystenlabs.com/graphql): Sui GraphiQL IDE for the Testnet network. 
+- [Sui Testnet GraphiQL](https://sui-testnet.mystenlabs.com/graphql): Sui GraphiQL IDE for the Testnet network.
 - [Sui Mainnet GraphiQL](https://sui-mainnet.mystenlabs.com/graphql): Sui GraphiQL IDE for the Mainnet network.

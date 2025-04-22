@@ -10,7 +10,7 @@ use crate::storage::ObjectStore;
 use crate::sui_serde::Readable;
 use crate::sui_serde::SuiTypeTag;
 use crate::{MoveTypeTagTrait, ObjectID, SequenceNumber, SUI_FRAMEWORK_ADDRESS};
-use fastcrypto::encoding::Base58;
+use fastcrypto::encoding::Base64;
 use fastcrypto::hash::HashFunction;
 use move_core_types::annotated_value::{MoveStruct, MoveValue};
 use move_core_types::ident_str;
@@ -27,8 +27,10 @@ use shared_crypto::intent::HashingIntentScope;
 use std::fmt;
 use std::fmt::{Display, Formatter};
 
-const DYNAMIC_FIELD_MODULE_NAME: &IdentStr = ident_str!("dynamic_field");
-const DYNAMIC_FIELD_FIELD_STRUCT_NAME: &IdentStr = ident_str!("Field");
+pub mod visitor;
+
+pub const DYNAMIC_FIELD_MODULE_NAME: &IdentStr = ident_str!("dynamic_field");
+pub const DYNAMIC_FIELD_FIELD_STRUCT_NAME: &IdentStr = ident_str!("Field");
 
 const DYNAMIC_OBJECT_FIELD_MODULE_NAME: &IdentStr = ident_str!("dynamic_object_field");
 const DYNAMIC_OBJECT_FIELD_WRAPPER_STRUCT_NAME: &IdentStr = ident_str!("Wrapper");
@@ -59,12 +61,11 @@ where
 }
 
 #[serde_as]
-#[derive(Clone, Serialize, Deserialize, JsonSchema, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct DynamicFieldInfo {
     pub name: DynamicFieldName,
-    #[schemars(with = "Base58")]
-    #[serde_as(as = "Readable<Base58, _>")]
+    #[serde_as(as = "Readable<Base64, _>")]
     pub bcs_name: Vec<u8>,
     pub type_: DynamicFieldType,
     pub object_type: String,
@@ -93,7 +94,9 @@ impl Display for DynamicFieldName {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, JsonSchema, Ord, PartialOrd, Eq, PartialEq, Debug)]
+#[derive(
+    Copy, Clone, Serialize, Deserialize, JsonSchema, Ord, PartialOrd, Eq, PartialEq, Debug,
+)]
 pub enum DynamicFieldType {
     #[serde(rename_all = "camelCase")]
     DynamicField,
@@ -307,7 +310,7 @@ where
 {
     let id = derive_dynamic_field_id(parent_id, &K::get_type_tag(), &bcs::to_bytes(key).unwrap())
         .map_err(|err| SuiError::DynamicFieldReadError(err.to_string()))?;
-    let object = object_store.get_object(&id)?.ok_or_else(|| {
+    let object = object_store.get_object(&id).ok_or_else(|| {
         SuiError::DynamicFieldReadError(format!(
             "Dynamic field with key={:?} and ID={:?} not found on parent {:?}",
             key, id, parent_id

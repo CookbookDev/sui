@@ -56,8 +56,7 @@ async fn test_blocking_execution() -> Result<(), anyhow::Error> {
         .state()
         .get_transaction_cache_reader()
         .notify_read_executed_effects(&[digest])
-        .await
-        .unwrap();
+        .await;
 
     // Transaction Orchestrator proactivcely executes txn locally
     let txn = txns.swap_remove(0);
@@ -146,7 +145,7 @@ async fn test_fullnode_wal_log() -> Result<(), anyhow::Error> {
 
     // Because the tx did not go through, we expect to see it in the WAL log
     let pending_txes: Vec<_> = orchestrator
-        .load_all_pending_transactions()
+        .load_all_pending_transactions()?
         .into_iter()
         .map(|t| t.into_inner())
         .collect();
@@ -168,7 +167,7 @@ async fn test_fullnode_wal_log() -> Result<(), anyhow::Error> {
     // response is returned and we will not need the sleep.
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
     // The tx should be erased in wal log.
-    let pending_txes = orchestrator.load_all_pending_transactions();
+    let pending_txes = orchestrator.load_all_pending_transactions()?;
     assert!(pending_txes.is_empty());
 
     Ok(())

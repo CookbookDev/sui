@@ -133,7 +133,7 @@ impl QueryExecutor for PgExecutor {
 }
 
 #[async_trait]
-impl<'c> super::DbConnection for PgConnection<'c> {
+impl super::DbConnection for PgConnection<'_> {
     type Connection = diesel_async::AsyncPgConnection;
     type Backend = Pg;
 
@@ -247,8 +247,9 @@ mod tests {
     use sui_framework::BuiltInFramework;
     use sui_indexer::{
         database::Connection, db::reset_database, models::objects::StoredObject, schema::objects,
-        tempdb::TempDb, types::IndexedObject,
+        types::IndexedObject,
     };
+    use sui_pg_db::temp::TempDb;
 
     #[tokio::test]
     async fn test_query_cost() {

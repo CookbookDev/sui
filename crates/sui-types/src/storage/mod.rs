@@ -7,12 +7,17 @@ mod read_store;
 mod shared_in_memory_store;
 mod write_store;
 
-use crate::base_types::{TransactionDigest, VersionNumber};
+use crate::base_types::{
+    ConsensusObjectSequenceKey, FullObjectID, FullObjectRef, TransactionDigest, VersionNumber,
+};
 use crate::committee::EpochId;
+use crate::effects::{TransactionEffects, TransactionEffectsAPI};
 use crate::error::{ExecutionError, SuiError};
 use crate::execution::{DynamicallyLoadedObjectMetadata, ExecutionResults};
+use crate::message_envelope::Message;
 use crate::move_package::MovePackage;
-use crate::transaction::{SenderSignedData, TransactionDataAPI, TransactionKey};
+use crate::storage::error::Error as StorageError;
+use crate::transaction::{SenderSignedData, TransactionDataAPI};
 use crate::{
     base_types::{ObjectID, ObjectRef, SequenceNumber},
     error::SuiResult,
@@ -22,12 +27,15 @@ use itertools::Itertools;
 use move_binary_format::CompiledModule;
 use move_core_types::language_storage::ModuleId;
 pub use object_store_trait::ObjectStore;
-pub use read_store::AccountOwnedObjectInfo;
 pub use read_store::CoinInfo;
 pub use read_store::DynamicFieldIndexInfo;
 pub use read_store::DynamicFieldKey;
+pub use read_store::EpochInfo;
+pub use read_store::OwnedObjectInfo;
 pub use read_store::ReadStore;
-pub use read_store::RestStateReader;
+pub use read_store::RpcIndexes;
+pub use read_store::RpcStateReader;
+pub use read_store::TransactionInfo;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 pub use shared_in_memory_store::SharedInMemoryStore;
@@ -41,7 +49,7 @@ pub use write_store::WriteStore;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum InputKey {
     VersionedObject {
-        id: ObjectID,
+        id: FullObjectID,
         version: SequenceNumber,
     },
     Package {
@@ -50,10 +58,10 @@ pub enum InputKey {
 }
 
 impl InputKey {
-    pub fn id(&self) -> ObjectID {
+    pub fn id(&self) -> FullObjectID {
         match self {
             InputKey::VersionedObject { id, .. } => *id,
-            InputKey::Package { id } => *id,
+            InputKey::Package { id } => FullObjectID::Fastpath(*id),
         }
     }
 
@@ -78,7 +86,7 @@ impl From<&Object> for InputKey {
             InputKey::Package { id: obj.id() }
         } else {
             InputKey::VersionedObject {
-                id: obj.id(),
+                id: obj.full_id(),
                 version: obj.version(),
             }
         }
@@ -111,12 +119,13 @@ pub enum MarkerValue {
     /// An object was received at the given version in the transaction and is no longer able
     /// to be received at that version in subequent transactions.
     Received,
-    /// An owned object was deleted (or wrapped) at the given version, and is no longer able to be
-    /// accessed or used in subsequent transactions.
-    OwnedDeleted,
-    /// A shared object was deleted by the transaction and is no longer able to be accessed or
-    /// used in subsequent transactions.
-    SharedDeleted(TransactionDigest),
+    /// A fastpath object was deleted, wrapped, or transferred to consensus at the given
+    /// version, and is no longer able to be accessed or used in subsequent transactions via
+    /// fastpath unless/until it is returned to fastpath.
+    FastpathStreamEnded,
+    /// A consensus object was deleted or removed from consensus by the transaction and is no longer
+    /// able to be accessed or used in subsequent transactions with the same initial shared version.
+    ConsensusStreamEnded(TransactionDigest),
 }
 
 /// DeleteKind together with the old sequence number prior to the deletion, if available.
@@ -280,7 +289,7 @@ pub fn load_package_object_from_object_store(
     store: &impl ObjectStore,
     package_id: &ObjectID,
 ) -> SuiResult<Option<PackageObject>> {
-    let package = store.get_object(package_id)?;
+    let package = store.get_object(package_id);
     if let Some(obj) = &package {
         fp_ensure!(
             obj.is_package(),
@@ -384,35 +393,23 @@ impl BackingPackageStore for PostExecutionPackageResolver {
 pub trait ParentSync {
     /// This function is only called by older protocol versions.
     /// It creates an explicit dependency to tombstones, which is not desired.
-    fn get_latest_parent_entry_ref_deprecated(
-        &self,
-        object_id: ObjectID,
-    ) -> SuiResult<Option<ObjectRef>>;
+    fn get_latest_parent_entry_ref_deprecated(&self, object_id: ObjectID) -> Option<ObjectRef>;
 }
 
 impl<S: ParentSync> ParentSync for std::sync::Arc<S> {
-    fn get_latest_parent_entry_ref_deprecated(
-        &self,
-        object_id: ObjectID,
-    ) -> SuiResult<Option<ObjectRef>> {
+    fn get_latest_parent_entry_ref_deprecated(&self, object_id: ObjectID) -> Option<ObjectRef> {
         ParentSync::get_latest_parent_entry_ref_deprecated(self.as_ref(), object_id)
     }
 }
 
 impl<S: ParentSync> ParentSync for &S {
-    fn get_latest_parent_entry_ref_deprecated(
-        &self,
-        object_id: ObjectID,
-    ) -> SuiResult<Option<ObjectRef>> {
+    fn get_latest_parent_entry_ref_deprecated(&self, object_id: ObjectID) -> Option<ObjectRef> {
         ParentSync::get_latest_parent_entry_ref_deprecated(*self, object_id)
     }
 }
 
 impl<S: ParentSync> ParentSync for &mut S {
-    fn get_latest_parent_entry_ref_deprecated(
-        &self,
-        object_id: ObjectID,
-    ) -> SuiResult<Option<ObjectRef>> {
+    fn get_latest_parent_entry_ref_deprecated(&self, object_id: ObjectID) -> Option<ObjectRef> {
         ParentSync::get_latest_parent_entry_ref_deprecated(*self, object_id)
     }
 }
@@ -500,7 +497,6 @@ impl<S: ChildObjectResolver> ChildObjectResolver for &mut S {
     }
 }
 
-// The primary key type for object storage.
 #[serde_as]
 #[derive(Eq, PartialEq, Clone, Copy, PartialOrd, Ord, Hash, Serialize, Deserialize, Debug)]
 pub struct ObjectKey(pub ObjectID, pub VersionNumber);
@@ -526,6 +522,77 @@ impl From<ObjectRef> for ObjectKey {
 impl From<&ObjectRef> for ObjectKey {
     fn from(object_ref: &ObjectRef) -> Self {
         Self(object_ref.0, object_ref.1)
+    }
+}
+
+#[serde_as]
+#[derive(Eq, PartialEq, Clone, Copy, PartialOrd, Ord, Hash, Serialize, Deserialize, Debug)]
+pub struct ConsensusObjectKey(pub ConsensusObjectSequenceKey, pub VersionNumber);
+
+/// FullObjectKey represents a unique object a specific version. For fastpath objects, this
+/// is the same as ObjectKey. For consensus objects, this includes the start version, which
+/// may change if an object is transferred out of and back into consensus.
+#[serde_as]
+#[derive(Eq, PartialEq, Clone, Copy, PartialOrd, Ord, Hash, Serialize, Deserialize, Debug)]
+pub enum FullObjectKey {
+    Fastpath(ObjectKey),
+    Consensus(ConsensusObjectKey),
+}
+
+impl FullObjectKey {
+    pub fn max_for_id(id: &FullObjectID) -> Self {
+        match id {
+            FullObjectID::Fastpath(object_id) => Self::Fastpath(ObjectKey::max_for_id(object_id)),
+            FullObjectID::Consensus(consensus_object_sequence_key) => Self::Consensus(
+                ConsensusObjectKey(*consensus_object_sequence_key, VersionNumber::MAX),
+            ),
+        }
+    }
+
+    pub fn min_for_id(id: &FullObjectID) -> Self {
+        match id {
+            FullObjectID::Fastpath(object_id) => Self::Fastpath(ObjectKey::min_for_id(object_id)),
+            FullObjectID::Consensus(consensus_object_sequence_key) => Self::Consensus(
+                ConsensusObjectKey(*consensus_object_sequence_key, VersionNumber::MIN),
+            ),
+        }
+    }
+
+    pub fn new(object_id: FullObjectID, version: VersionNumber) -> Self {
+        match object_id {
+            FullObjectID::Fastpath(object_id) => Self::Fastpath(ObjectKey(object_id, version)),
+            FullObjectID::Consensus(consensus_object_sequence_key) => {
+                Self::Consensus(ConsensusObjectKey(consensus_object_sequence_key, version))
+            }
+        }
+    }
+
+    pub fn id(&self) -> FullObjectID {
+        match self {
+            FullObjectKey::Fastpath(object_key) => FullObjectID::Fastpath(object_key.0),
+            FullObjectKey::Consensus(consensus_object_key) => {
+                FullObjectID::Consensus(consensus_object_key.0)
+            }
+        }
+    }
+
+    pub fn version(&self) -> VersionNumber {
+        match self {
+            FullObjectKey::Fastpath(object_key) => object_key.1,
+            FullObjectKey::Consensus(consensus_object_key) => consensus_object_key.1,
+        }
+    }
+}
+
+impl From<FullObjectRef> for FullObjectKey {
+    fn from(object_ref: FullObjectRef) -> Self {
+        FullObjectKey::from(&object_ref)
+    }
+}
+
+impl From<&FullObjectRef> for FullObjectKey {
+    fn from(object_ref: &FullObjectRef) -> Self {
+        FullObjectKey::new(object_ref.0, object_ref.1)
     }
 }
 
@@ -605,9 +672,58 @@ where
     }
 }
 
-pub trait GetSharedLocks: Send + Sync {
-    fn get_shared_locks(
-        &self,
-        key: &TransactionKey,
-    ) -> Result<Vec<(ObjectID, SequenceNumber)>, SuiError>;
+pub fn get_transaction_input_objects(
+    object_store: &dyn ObjectStore,
+    effects: &TransactionEffects,
+) -> Result<Vec<Object>, StorageError> {
+    let input_object_keys = effects
+        .modified_at_versions()
+        .into_iter()
+        .map(|(object_id, version)| ObjectKey(object_id, version))
+        .collect::<Vec<_>>();
+
+    let input_objects = object_store
+        .multi_get_objects_by_key(&input_object_keys)
+        .into_iter()
+        .enumerate()
+        .map(|(idx, maybe_object)| {
+            maybe_object.ok_or_else(|| {
+                StorageError::custom(format!(
+                    "missing input object key {:?} from tx {} effects {}",
+                    input_object_keys[idx],
+                    effects.transaction_digest(),
+                    effects.digest()
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(input_objects)
+}
+
+pub fn get_transaction_output_objects(
+    object_store: &dyn ObjectStore,
+    effects: &TransactionEffects,
+) -> Result<Vec<Object>, StorageError> {
+    let output_object_keys = effects
+        .all_changed_objects()
+        .into_iter()
+        .map(|(object_ref, _owner, _kind)| ObjectKey::from(object_ref))
+        .collect::<Vec<_>>();
+
+    let output_objects = object_store
+        .multi_get_objects_by_key(&output_object_keys)
+        .into_iter()
+        .enumerate()
+        .map(|(idx, maybe_object)| {
+            maybe_object.ok_or_else(|| {
+                StorageError::custom(format!(
+                    "missing output object key {:?} from tx {} effects {}",
+                    output_object_keys[idx],
+                    effects.transaction_digest(),
+                    effects.digest()
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(output_objects)
 }

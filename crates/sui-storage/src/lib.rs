@@ -2,15 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #![allow(dead_code)]
 
-pub mod indexes;
-
 use crate::blob::BlobIter;
 use anyhow::{anyhow, Result};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use bytes::{Buf, Bytes};
 use fastcrypto::hash::{HashFunction, Sha3_256};
 use futures::StreamExt;
-pub use indexes::{IndexStore, IndexStoreTables};
 use itertools::Itertools;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use serde::de::DeserializeOwned;
@@ -228,16 +225,13 @@ pub fn verify_checkpoint<S>(
 where
     S: WriteStore,
 {
-    let committee = store
-        .get_committee(checkpoint.epoch())
-        .expect("store operation should not fail")
-        .unwrap_or_else(|| {
-            panic!(
-                "BUG: should have committee for epoch {} before we try to verify checkpoint {}",
-                checkpoint.epoch(),
-                checkpoint.sequence_number()
-            )
-        });
+    let committee = store.get_committee(checkpoint.epoch()).unwrap_or_else(|| {
+        panic!(
+            "BUG: should have committee for epoch {} before we try to verify checkpoint {}",
+            checkpoint.epoch(),
+            checkpoint.sequence_number()
+        )
+    });
 
     verify_checkpoint_with_committee(committee, current, checkpoint)
 }
@@ -255,7 +249,6 @@ pub async fn verify_checkpoint_range<S>(
         .map(|(a, b)| {
             let current = store
                 .get_checkpoint_by_sequence_number(a)
-                .expect("store operation should not fail")
                 .unwrap_or_else(|| {
                     panic!(
                         "Checkpoint {} should exist in store after summary sync but does not",
@@ -264,23 +257,19 @@ pub async fn verify_checkpoint_range<S>(
                 });
             let next = store
                 .get_checkpoint_by_sequence_number(b)
-                .expect("store operation should not fail")
                 .unwrap_or_else(|| {
                     panic!(
                         "Checkpoint {} should exist in store after summary sync but does not",
                         a
                     );
                 });
-            let committee = store
-                .get_committee(next.epoch())
-                .expect("store operation should not fail")
-                .unwrap_or_else(|| {
-                    panic!(
-                        "BUG: should have committee for epoch {} before we try to verify checkpoint {}",
-                        next.epoch(),
-                        next.sequence_number()
-                    )
-                });
+            let committee = store.get_committee(next.epoch()).unwrap_or_else(|| {
+                panic!(
+                    "BUG: should have committee for epoch {} before we try to verify checkpoint {}",
+                    next.epoch(),
+                    next.sequence_number()
+                )
+            });
             tokio::spawn(async move {
                 verify_checkpoint_with_committee(committee, &current, next.clone().into())
                     .expect("Checkpoint verification failed");
@@ -298,7 +287,6 @@ pub async fn verify_checkpoint_range<S>(
         .expect("Received empty checkpoint range");
     let final_checkpoint = store
         .get_checkpoint_by_sequence_number(last)
-        .expect("Failed to fetch checkpoint")
         .expect("Expected end of checkpoint range to exist in store");
     store
         .update_highest_verified_checkpoint(&final_checkpoint)
@@ -323,9 +311,9 @@ fn hard_link(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> io::Result<()> {
 mod tests {
     use crate::hard_link;
     use tempfile::TempDir;
-    use typed_store::rocks::DBMap;
+    use typed_store::rocks::MetricConf;
     use typed_store::rocks::ReadWriteOptions;
-    use typed_store::rocks::{open_cf, MetricConf};
+    use typed_store::rocks::{default_db_options, open_cf_opts, DBMap};
     use typed_store::{reopen, Map};
 
     #[tokio::test]
@@ -339,11 +327,14 @@ mod tests {
         const FIRST_CF: &str = "First_CF";
         const SECOND_CF: &str = "Second_CF";
 
-        let db_a = open_cf(
+        let db_a = open_cf_opts(
             input_path,
             None,
             MetricConf::new("test_db_hard_link_1"),
-            &[FIRST_CF, SECOND_CF],
+            &[
+                (FIRST_CF, default_db_options().options),
+                (SECOND_CF, default_db_options().options),
+            ],
         )
         .unwrap();
 
@@ -357,11 +348,14 @@ mod tests {
 
         // set up db hard link
         hard_link(input_path, output_path)?;
-        let db_b = open_cf(
+        let db_b = open_cf_opts(
             output_path,
             None,
             MetricConf::new("test_db_hard_link_2"),
-            &[FIRST_CF, SECOND_CF],
+            &[
+                (FIRST_CF, default_db_options().options),
+                (SECOND_CF, default_db_options().options),
+            ],
         )
         .unwrap();
 

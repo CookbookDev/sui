@@ -29,7 +29,7 @@ const _: () = {
     assert!(BinaryFlavor::mask_and_shift_to_unflavor(x) == BinaryFlavor::SUI_FLAVOR);
 };
 
-/// Encoding of a the flavor into the version of the binary format for versions >= 7.
+/// Encoding of the flavor into the version of the binary format for versions >= 7.
 pub struct BinaryFlavor;
 impl BinaryFlavor {
     pub const FLAVOR_MASK: u32 = 0xFF00_0000;
@@ -66,7 +66,7 @@ impl BinaryFlavor {
     }
 
     const fn shift_and_flavor(unflavored: u32) -> u32 {
-        (Self::SUI_FLAVOR as u32) << Self::SHIFT_AMOUNT | unflavored
+        ((Self::SUI_FLAVOR as u32) << Self::SHIFT_AMOUNT) | unflavored
     }
 }
 
@@ -529,11 +529,10 @@ pub const VERSION_MAX: u32 = VERSION_7;
 // TODO(#145): finish v4 compatibility; as of now, only metadata is implemented
 pub const VERSION_MIN: u32 = VERSION_5;
 
-/// The encoding of the instruction is the serialized form of it, but disregarding the
-/// serialization of the instruction's argument(s).
-pub fn instruction_key(instruction: &Bytecode) -> u8 {
+/// The corresponding opcode for each bytecode (disregards the argument).
+pub fn instruction_opcode(instruction: &Bytecode) -> Opcodes {
     use Bytecode::*;
-    let opcode = match instruction {
+    match instruction {
         Pop => Opcodes::POP,
         Ret => Opcodes::RET,
         BrTrue(_) => Opcodes::BR_TRUE,
@@ -621,6 +620,11 @@ pub fn instruction_key(instruction: &Bytecode) -> u8 {
         MutBorrowGlobalGenericDeprecated(_) => Opcodes::MUT_BORROW_GLOBAL_GENERIC_DEPRECATED,
         ImmBorrowGlobalDeprecated(_) => Opcodes::IMM_BORROW_GLOBAL_DEPRECATED,
         ImmBorrowGlobalGenericDeprecated(_) => Opcodes::IMM_BORROW_GLOBAL_GENERIC_DEPRECATED,
-    };
-    opcode as u8
+    }
+}
+
+/// The encoding of the instruction is the serialized form of it, but disregarding the
+/// serialization of the instruction's argument(s).
+pub fn instruction_key(instruction: &Bytecode) -> u8 {
+    instruction_opcode(instruction) as u8
 }

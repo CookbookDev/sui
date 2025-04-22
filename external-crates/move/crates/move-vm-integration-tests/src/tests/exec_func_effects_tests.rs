@@ -4,7 +4,7 @@
 
 use std::convert::TryInto;
 
-use crate::compiler::{as_module, compile_units};
+use crate::compiler::{as_module, compile_units, serialize_module_at_max_version};
 use move_binary_format::errors::VMResult;
 use move_core_types::{
     account_address::AccountAddress,
@@ -52,7 +52,7 @@ fn fail_arg_deserialize() {
     }
 }
 
-// check happy path for writing to mut ref args - may be unecessary / covered by other tests
+// check happy path for writing to mut ref args - may be unnecessary / covered by other tests
 #[test]
 fn mutref_output_success() {
     let mod_code = setup_module();
@@ -101,6 +101,7 @@ fn run(
             vec![],
             serialize_values(&vec![arg_val0]),
             &mut UnmeteredGasMeter,
+            None,
         )
         .and_then(|ret_values| {
             let change_set = session.finish().0?;
@@ -127,7 +128,7 @@ fn compile_module(storage: &mut InMemoryStorage, mod_id: &ModuleId, code: &str) 
     let mut units = compile_units(code).unwrap();
     let module = as_module(units.pop().unwrap());
     let mut blob = vec![];
-    module.serialize(&mut blob).unwrap();
+    serialize_module_at_max_version(&module, &mut blob).unwrap();
     storage.publish_or_overwrite_module(mod_id.clone(), blob);
 }
 

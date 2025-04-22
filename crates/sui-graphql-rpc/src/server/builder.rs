@@ -79,7 +79,6 @@ pub(crate) struct Server {
     system_package_task: SystemPackageTask,
     trigger_exchange_rates_task: TriggerExchangeRatesTask,
     state: AppState,
-    db_reader: Db,
 }
 
 impl Server {
@@ -87,15 +86,6 @@ impl Server {
     /// signal is received, the method waits for all tasks to complete before returning.
     pub async fn run(mut self) -> Result<(), Error> {
         get_or_init_server_start_time().await;
-
-        let mut connection = self
-            .db_reader
-            .inner
-            .pool()
-            .get()
-            .await
-            .map_err(|e| Error::Internal(e.to_string()))?;
-        check_db_migration_consistency(&mut connection).await?;
 
         // A handle that spawns a background task to periodically update the `Watermark`, which
         // consists of the checkpoint upper bound and current epoch.
@@ -265,12 +255,9 @@ impl ServerBuilder {
         if self.router.is_none() {
             let router: Router = Router::new()
                 .route("/", post(graphql_handler))
-                .route("/:version", post(graphql_handler))
                 .route("/graphql", post(graphql_handler))
-                .route("/graphql/:version", post(graphql_handler))
                 .route("/health", get(health_check))
                 .route("/graphql/health", get(health_check))
-                .route("/graphql/:version/health", get(health_check))
                 .with_state(self.state.clone())
                 .route_layer(CallbackLayer::new(MetricsMakeCallbackHandler {
                     metrics: self.state.metrics.clone(),
@@ -345,7 +332,7 @@ impl ServerBuilder {
         );
 
         let trigger_exchange_rates_task = TriggerExchangeRatesTask::new(
-            db_reader.clone(),
+            db_reader,
             watermark_task.epoch_receiver(),
             state.cancellation_token.clone(),
         );
@@ -367,7 +354,6 @@ impl ServerBuilder {
             system_package_task,
             trigger_exchange_rates_task,
             state,
-            db_reader,
         })
     }
 
@@ -381,13 +367,13 @@ impl ServerBuilder {
         // PROMETHEUS
         let prom_addr: SocketAddr = format!(
             "{}:{}",
-            config.connection.prom_url, config.connection.prom_port
+            config.connection.prom_host, config.connection.prom_port
         )
         .parse()
         .map_err(|_| {
             Error::Internal(format!(
                 "Failed to parse url {}, port {} into socket address",
-                config.connection.prom_url, config.connection.prom_port
+                config.connection.prom_host, config.connection.prom_port
             ))
         })?;
 
@@ -426,6 +412,17 @@ impl ServerBuilder {
         )
         .await
         .map_err(|e| Error::Internal(format!("Failed to create pg connection pool: {}", e)))?;
+
+        if !config.connection.skip_migration_consistency_check {
+            check_db_migration_consistency(
+                &mut reader
+                    .pool()
+                    .get()
+                    .await
+                    .map_err(|e| Error::Internal(e.to_string()))?,
+            )
+            .await?;
+        }
 
         // DB
         let db = Db::new(
@@ -472,7 +469,10 @@ impl ServerBuilder {
             .context_data(metrics.clone())
             .context_data(config.clone())
             .context_data(move_registry_config.clone())
-            .context_data(MoveRegistryDataLoader::new(move_registry_config));
+            .context_data(MoveRegistryDataLoader::new(
+                move_registry_config,
+                metrics.clone(),
+            ));
 
         if config.internal_features.feature_gate {
             builder = builder.extension(FeatureGate);
@@ -583,13 +583,13 @@ struct MetricsCallbackHandler {
 }
 
 impl ResponseHandler for MetricsCallbackHandler {
-    fn on_response(self, response: &http::response::Parts) {
+    fn on_response(&mut self, response: &http::response::Parts) {
         if let Some(errors) = response.extensions.get::<GraphqlErrors>() {
             self.metrics.inc_errors(&errors.0);
         }
     }
 
-    fn on_error<E>(self, _error: &E) {
+    fn on_error<E>(&mut self, _error: &E) {
         // Do nothing if the whole service errored
         //
         // in Axum this isn't possible since all services are required to have an error type of
@@ -655,7 +655,7 @@ async fn health_check(
         .unwrap_or_else(|| DEFAULT_MAX_CHECKPOINT_LAG);
 
     let checkpoint_timestamp =
-        Duration::from_millis(watermark_lock.read().await.checkpoint_timestamp_ms);
+        Duration::from_millis(watermark_lock.read().await.hi_cp_timestamp_ms);
 
     let now_millis = Utc::now().timestamp_millis();
 
@@ -695,7 +695,7 @@ pub mod tests {
     use serde_json::json;
     use std::sync::Arc;
     use std::time::Duration;
-    use sui_indexer::tempdb::get_available_port;
+    use sui_pg_db::temp::get_available_port;
     use sui_sdk::SuiClient;
     use sui_types::digests::get_mainnet_chain_identifier;
     use sui_types::transaction::TransactionData;
@@ -709,8 +709,9 @@ pub mod tests {
             host: "127.0.0.1".to_owned(),
             db_url,
             db_pool_size: 5,
-            prom_url: "127.0.0.1".to_owned(),
+            prom_host: "127.0.0.1".to_owned(),
             prom_port: get_available_port(),
+            skip_migration_consistency_check: false,
         };
         let service_config = service_config.unwrap_or_default();
 
@@ -733,9 +734,11 @@ pub mod tests {
         let pg_conn_pool = PgManager::new(reader);
         let cancellation_token = CancellationToken::new();
         let watermark = Watermark {
-            checkpoint: 1,
-            checkpoint_timestamp_ms: 1,
+            hi_cp: 1,
+            hi_cp_timestamp_ms: 1,
             epoch: 0,
+            lo_cp: 0,
+            lo_tx: 0,
         };
         let state = AppState::new(
             connection_config.clone(),
@@ -778,7 +781,7 @@ pub mod tests {
         telemetry_subscribers::init_for_testing();
         let cluster = start_cluster(ServiceConfig::test_defaults()).await;
         cluster
-            .wait_for_checkpoint_catchup(1, Duration::from_secs(10))
+            .wait_for_checkpoint_catchup(1, Duration::from_secs(30))
             .await;
         // timeout test includes mutation timeout, which requires a [SuiClient] to be able to run
         // the test, and a transaction. [WalletContext] gives access to everything that's needed.
@@ -1214,8 +1217,8 @@ pub mod tests {
             )
             .await,
             "Query part too large: 354 bytes. Requests are limited to 400 bytes or fewer on \
-             transaction payloads (all inputs to executeTransactionBlock or \
-             dryRunTransactionBlock) and the rest of the request (the query part) must be 10 \
+             transaction payloads (all inputs to executeTransactionBlock, dryRunTransactionBlock, \
+             or verifyZkloginSignature) and the rest of the request (the query part) must be 10 \
              bytes or fewer."
         );
     }
@@ -1245,8 +1248,8 @@ pub mod tests {
             )
             .await,
             "Transaction payload too large. Requests are limited to 10 bytes or fewer on \
-             transaction payloads (all inputs to executeTransactionBlock or \
-             dryRunTransactionBlock) and the rest of the request (the query part) must be 400 \
+             transaction payloads (all inputs to executeTransactionBlock, dryRunTransactionBlock, \
+             or verifyZkloginSignature) and the rest of the request (the query part) must be 400 \
              bytes or fewer."
         );
     }
@@ -1277,9 +1280,44 @@ pub mod tests {
             )
             .await,
             "Transaction payload too large. Requests are limited to 10 bytes or fewer on \
-             transaction payloads (all inputs to executeTransactionBlock or \
-             dryRunTransactionBlock) and the rest of the request (the query part) must be 400 bytes \
+             transaction payloads (all inputs to executeTransactionBlock, dryRunTransactionBlock, \
+             or verifyZkloginSignature) and the rest of the request (the query part) must be 400 bytes \
              or fewer."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_payload_zklogin_exceeded() {
+        let cluster = prep_executor_cluster().await;
+        let db_url = cluster.graphql_connection_config.db_url.clone();
+        assert_eq!(
+            execute_for_error(
+                &db_url,
+                Limits {
+                    max_tx_payload_size: 10,
+                    max_query_payload_size: 600,
+                    ..Default::default()
+                },
+                r#"
+                    query {
+                        verifyZkloginSignature(
+                            bytes: "AAABBBCCC",
+                            signature: "DDD",
+                            intentScope: TRANSACTION_DATA,
+                            author: "0xeee",
+                        ) {
+                            success
+                            errors
+                        }
+                    }
+                "#
+                .into(),
+            )
+            .await,
+            "Transaction payload too large. Requests are limited to 10 bytes or fewer on \
+             transaction payloads (all inputs to executeTransactionBlock, dryRunTransactionBlock, \
+             or verifyZkloginSignature) and the rest of the request (the query part) must be 600 \
+             bytes or fewer."
         );
     }
 
@@ -1309,8 +1347,9 @@ pub mod tests {
             )
             .await,
             "Overall request too large: 380 bytes. Requests are limited to 10 bytes or fewer on \
-             transaction payloads (all inputs to executeTransactionBlock or dryRunTransactionBlock) \
-             and the rest of the request (the query part) must be 10 bytes or fewer."
+             transaction payloads (all inputs to executeTransactionBlock, dryRunTransactionBlock, \
+             or verifyZkloginSignature) and the rest of the request (the query part) must be 10 \
+             bytes or fewer."
         );
     }
 
@@ -1344,8 +1383,8 @@ pub mod tests {
             )
             .await,
             "Transaction payload too large. Requests are limited to 10 bytes or fewer on \
-             transaction payloads (all inputs to executeTransactionBlock or \
-             dryRunTransactionBlock) and the rest of the request (the query part) must be 500 \
+             transaction payloads (all inputs to executeTransactionBlock, dryRunTransactionBlock, \
+             or verifyZkloginSignature) and the rest of the request (the query part) must be 500 \
              bytes or fewer."
         );
     }
@@ -1380,9 +1419,9 @@ pub mod tests {
             )
             .await,
             "Query part too large: 409 bytes. Requests are limited to 500 bytes or fewer on \
-             transaction payloads (all inputs to executeTransactionBlock or \
-             dryRunTransactionBlock) and the rest of the request (the query part) must be 10 bytes \
-             or fewer."
+             transaction payloads (all inputs to executeTransactionBlock, dryRunTransactionBlock, \
+             or verifyZkloginSignature) and the rest of the request (the query part) must be 10 \
+             bytes or fewer."
         );
     }
 
@@ -1416,8 +1455,8 @@ pub mod tests {
             )
             .await,
             "Transaction payload too large. Requests are limited to 10 bytes or fewer on \
-             transaction payloads (all inputs to executeTransactionBlock or \
-             dryRunTransactionBlock) and the rest of the request (the query part) must be 400 \
+             transaction payloads (all inputs to executeTransactionBlock, dryRunTransactionBlock, \
+             or verifyZkloginSignature) and the rest of the request (the query part) must be 400 \
              bytes or fewer."
         );
     }
@@ -1452,9 +1491,9 @@ pub mod tests {
             )
             .await,
             "Query part too large: 398 bytes. Requests are limited to 400 bytes or fewer on \
-             transaction payloads (all inputs to executeTransactionBlock or \
-             dryRunTransactionBlock) and the rest of the request (the query part) must be 10 bytes \
-             or fewer."
+             transaction payloads (all inputs to executeTransactionBlock, dryRunTransactionBlock, \
+             or verifyZkloginSignature) and the rest of the request (the query part) must be 10 \
+             bytes or fewer."
         );
     }
 
@@ -1511,8 +1550,8 @@ pub mod tests {
             )
             .await,
             "Transaction payload too large. Requests are limited to 30 bytes or fewer on \
-             transaction payloads (all inputs to executeTransactionBlock or \
-             dryRunTransactionBlock) and the rest of the request (the query part) must be 800 \
+             transaction payloads (all inputs to executeTransactionBlock, dryRunTransactionBlock, \
+             or verifyZkloginSignature) and the rest of the request (the query part) must be 800 \
              bytes or fewer."
         );
     }
@@ -1573,8 +1612,8 @@ pub mod tests {
             )
             .await,
             "Transaction payload too large. Requests are limited to 20 bytes or fewer on \
-             transaction payloads (all inputs to executeTransactionBlock or \
-             dryRunTransactionBlock) and the rest of the request (the query part) must be 800 \
+             transaction payloads (all inputs to executeTransactionBlock, dryRunTransactionBlock, \
+             or verifyZkloginSignature) and the rest of the request (the query part) must be 800 \
              bytes or fewer."
         );
     }
@@ -1631,8 +1670,8 @@ pub mod tests {
             )
             .await,
             "Transaction payload too large. Requests are limited to 30 bytes or fewer on \
-             transaction payloads (all inputs to executeTransactionBlock or \
-             dryRunTransactionBlock) and the rest of the request (the query part) must be 500 \
+             transaction payloads (all inputs to executeTransactionBlock, dryRunTransactionBlock, \
+             or verifyZkloginSignature) and the rest of the request (the query part) must be 500 \
              bytes or fewer.",
         )
     }
@@ -1669,8 +1708,8 @@ pub mod tests {
             )
             .await,
             "Transaction payload too large. Requests are limited to 10 bytes or fewer on \
-             transaction payloads (all inputs to executeTransactionBlock or \
-             dryRunTransactionBlock) and the rest of the request (the query part) must be 500 \
+             transaction payloads (all inputs to executeTransactionBlock, dryRunTransactionBlock, \
+             or verifyZkloginSignature) and the rest of the request (the query part) must be 500 \
              bytes or fewer."
         );
     }
@@ -1920,8 +1959,8 @@ pub mod tests {
             )
             .await,
             "Transaction payload too large. Requests are limited to 10 bytes or fewer on \
-             transaction payloads (all inputs to executeTransactionBlock or \
-             dryRunTransactionBlock) and the rest of the request (the query part) must be 500 \
+             transaction payloads (all inputs to executeTransactionBlock, dryRunTransactionBlock, \
+             or verifyZkloginSignature) and the rest of the request (the query part) must be 500 \
              bytes or fewer."
         );
     }
@@ -1953,8 +1992,8 @@ pub mod tests {
             )
             .await,
             "Transaction payload too large. Requests are limited to 10 bytes or fewer on \
-             transaction payloads (all inputs to executeTransactionBlock or \
-             dryRunTransactionBlock) and the rest of the request (the query part) must be 500 \
+             transaction payloads (all inputs to executeTransactionBlock, dryRunTransactionBlock, \
+             or verifyZkloginSignature) and the rest of the request (the query part) must be 500 \
              bytes or fewer."
         );
     }
@@ -1989,8 +2028,8 @@ pub mod tests {
             )
             .await,
             "Transaction payload too large. Requests are limited to 10 bytes or fewer on \
-             transaction payloads (all inputs to executeTransactionBlock or \
-             dryRunTransactionBlock) and the rest of the request (the query part) must be 500 \
+             transaction payloads (all inputs to executeTransactionBlock, dryRunTransactionBlock, \
+             or verifyZkloginSignature) and the rest of the request (the query part) must be 500 \
              bytes or fewer."
         );
     }
@@ -2023,9 +2062,128 @@ pub mod tests {
             )
             .await,
             "Transaction payload too large. Requests are limited to 10 bytes or fewer on \
-             transaction payloads (all inputs to executeTransactionBlock or \
-             dryRunTransactionBlock) and the rest of the request (the query part) must be 500 \
+             transaction payloads (all inputs to executeTransactionBlock, dryRunTransactionBlock, \
+             or verifyZkloginSignature) and the rest of the request (the query part) must be 500 \
              bytes or fewer."
         );
+    }
+
+    #[tokio::test]
+    async fn test_multi_get_objects_query_limits_exceeded() {
+        let cluster = prep_executor_cluster().await;
+        let db_url = cluster.graphql_connection_config.db_url.clone();
+        assert_eq!(
+            execute_for_error(
+                &db_url,
+                Limits {
+                    max_output_nodes: 5,
+                    ..Default::default()
+                }, // the query will have 6 output nodes: 2 keys * 3 fields, thus exceeding the
+                   // limit
+                r#"
+                    query {
+                          multiGetObjects(
+                            keys: [
+                              {objectId: "0x01dcb4674affb04e68d8088895e951f4ea335ef1695e9e50c166618f6789d808", version: 2},
+                              {objectId: "0x23e340e97fb41249278c85b1f067dc88576f750670c6dc56572e90971f857c8c", version: 2},
+                            ]
+                          ) {
+                                address
+                                status
+                                version
+                            }
+                    }
+                "#
+                .into(),
+            )
+            .await,
+            "Estimated output nodes exceeds 5"
+        );
+        assert_eq!(
+            execute_for_error(
+                &db_url,
+                Limits {
+                    max_output_nodes: 4,
+                    ..Default::default()
+                }, // the query will have 5 output nodes: 5keys * 1 field, thus exceeding the limit
+                r#"
+                    query {
+                          multiGetObjects(
+                            keys: [
+                              {objectId: "0x01dcb4674affb04e68d8088895e951f4ea335ef1695e9e50c166618f6789d808", version: 2},
+                              {objectId: "0x23e340e97fb41249278c85b1f067dc88576f750670c6dc56572e90971f857c8c", version: 2},
+                              {objectId: "0x23e340e97fb41249278c85b1f067dc88576f750670c6dc56572e90971f857c8c", version: 2},
+                              {objectId: "0x33032e0706337632361f2607b79df8c9d1079e8069259b27b1fa5c0394e79893", version: 2},
+                              {objectId: "0x388295e3ecad53986ebf9a7a1e5854b7df94c3f1f0bba934c5396a2a9eb4550b", version: 2},
+                            ]
+                          ) {
+                                address
+                            }
+                    }
+                "#
+                .into(),
+            )
+            .await,
+            "Estimated output nodes exceeds 4"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multi_get_objects_query_limits_pass() {
+        let cluster = prep_executor_cluster().await;
+        let db_url = cluster.graphql_connection_config.db_url.clone();
+        let service_config = ServiceConfig {
+            limits: Limits {
+                max_output_nodes: 5,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let schema = prep_schema(db_url, Some(service_config))
+            .await
+            .build_schema();
+
+        let resp = schema
+            .execute(
+                // query will have 5 output nodes: 5 keys * 1 field, thus not exceeding the limit
+                r#"
+                    query {
+                          multiGetObjects(
+                            keys: [
+                              {objectId: "0x01dcb4674affb04e68d8088895e951f4ea335ef1695e9e50c166618f6789d808", version: 2},
+                              {objectId: "0x23e340e97fb41249278c85b1f067dc88576f750670c6dc56572e90971f857c8c", version: 2},
+                              {objectId: "0x23e340e97fb41249278c85b1f067dc88576f750670c6dc56572e90971f857c8c", version: 2},
+                              {objectId: "0x33032e0706337632361f2607b79df8c9d1079e8069259b27b1fa5c0394e79893", version: 2},
+                              {objectId: "0x388295e3ecad53986ebf9a7a1e5854b7df94c3f1f0bba934c5396a2a9eb4550b", version: 2},
+                            ]
+                          ) {
+                                address
+                            }
+                    }
+                "#)
+            .await;
+        assert!(resp.is_ok());
+        assert!(resp.errors.is_empty());
+
+        let resp = schema
+            .execute(
+                // query will have 4 output nodes: 2 keys * 2 fields, thus not exceeding the limit
+                r#"
+                    query {
+                          multiGetObjects(
+                            keys: [
+                              {objectId: "0x01dcb4674affb04e68d8088895e951f4ea335ef1695e9e50c166618f6789d808", version: 2},
+                              {objectId: "0x23e340e97fb41249278c85b1f067dc88576f750670c6dc56572e90971f857c8c", version: 2},
+                            ]
+                          ) {
+                                address
+                                status
+                            }
+                    }
+                "#)
+            .await;
+        assert!(resp.is_ok());
+        assert!(resp.errors.is_empty());
     }
 }

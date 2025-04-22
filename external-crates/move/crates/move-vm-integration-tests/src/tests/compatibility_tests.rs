@@ -9,10 +9,14 @@ use move_binary_format::{
 };
 use move_ir_to_bytecode::{compiler::compile_module, parser::parse_module};
 
-fn compile(prog: &str) -> normalized::Module {
+fn compile(prog: &str) -> normalized::Module<normalized::RcIdentifier> {
     let prog = parse_module(prog).unwrap();
     let (compiled_module, _) = compile_module(prog, vec![]).unwrap();
-    normalized::Module::new(&compiled_module)
+    normalized::Module::new(
+        &mut normalized::RcPool::new(),
+        &compiled_module,
+        /* include code */ true,
+    )
 }
 
 // Things to test for enum upgrades
@@ -199,10 +203,7 @@ fn test_enum_upgrade_add_variant_at_front() {
         }
         ",
     );
-    let mut compat = Compatibility::default();
-    assert!(compat.disallow_new_variants);
-    assert!(compat.check(&old, &new).is_err());
-    compat.disallow_new_variants = false;
+    let compat = Compatibility::default();
     assert!(compat.check(&old, &new).is_err());
     assert!(InclusionCheck::Equal.check(&old, &new).is_err());
     assert!(InclusionCheck::Subset.check(&old, &new).is_err());
@@ -226,12 +227,9 @@ fn test_enum_upgrade_add_variant_at_end() {
         }
         ",
     );
-    let mut compat = Compatibility::default();
-    assert!(compat.disallow_new_variants);
+    let compat = Compatibility::default();
     assert!(compat.check(&old, &new).is_err());
     // Allow adding new variants at the end of the enum
-    compat.disallow_new_variants = false;
-    assert!(compat.check(&old, &new).is_ok());
     assert!(InclusionCheck::Equal.check(&old, &new).is_err());
     // NOTE: We currently restrict all enums (even in subset mode) so that new enum variants are not
     // allowed. This assertion will fail when we allow new enum variants in subset mode and should

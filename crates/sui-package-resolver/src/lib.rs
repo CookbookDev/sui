@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::{borrow::Cow, collections::BTreeMap};
 use sui_types::base_types::is_primitive_type_tag;
 use sui_types::transaction::{Argument, CallArg, Command, ProgrammableTransaction};
+use sui_types::type_input::{StructInput, TypeInput};
 
 use crate::error::Error;
 use move_binary_format::errors::Location;
@@ -54,7 +55,7 @@ pub struct Resolver<S> {
 
 /// Optional configuration that imposes limits on the work that the resolver can do for each
 /// request.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Limits {
     /// Maximum recursion depth through type parameters.
     pub max_type_argument_depth: usize,
@@ -347,6 +348,33 @@ impl<S> Resolver<S> {
 }
 
 impl<S: PackageStore> Resolver<S> {
+    /// The canonical form of a type refers to each type in terms of its defining package ID. This
+    /// function takes a non-canonical type and updates all its package IDs to the appropriate
+    /// defining ID.
+    ///
+    /// For every `package::module::datatype` in the input `tag`, `package` must be an object
+    /// on-chain, containing a move package that includes `module`, and that module must define the
+    /// `datatype`. In practice this means the input type `tag` can refer to types at or after
+    /// their defining IDs.
+    pub async fn canonical_type(&self, mut tag: TypeTag) -> Result<TypeTag> {
+        let mut context = ResolutionContext::new(self.limits.as_ref());
+
+        // (1). Fetch all the information from this store that is necessary to relocate package IDs
+        // in the type.
+        context
+            .add_type_tag(
+                &mut tag,
+                &self.package_store,
+                /* visit_fields */ false,
+                /* visit_phantoms */ true,
+            )
+            .await?;
+
+        // (2). Use that information to relocate package IDs in the type.
+        context.canonicalize_type(&mut tag)?;
+        Ok(tag)
+    }
+
     /// Return the type layout corresponding to the given type tag.  The layout always refers to
     /// structs in terms of their defining ID (i.e. their package ID always points to the first
     /// package that introduced them).
@@ -398,16 +426,16 @@ impl<S: PackageStore> Resolver<S> {
 
     /// Returns the signatures of parameters to function `pkg::module::function` in the package
     /// store, assuming the function exists.
-    pub async fn function_parameters(
+    pub async fn function_signature(
         &self,
         pkg: AccountAddress,
         module: &str,
         function: &str,
-    ) -> Result<Vec<OpenSignature>> {
+    ) -> Result<FunctionDef> {
         let mut context = ResolutionContext::new(self.limits.as_ref());
 
         let package = self.package_store.fetch(pkg).await?;
-        let Some(def) = package.module(module)?.function_def(function)? else {
+        let Some(mut def) = package.module(module)?.function_def(function)? else {
             return Err(Error::FunctionNotFound(
                 pkg,
                 module.to_string(),
@@ -415,11 +443,9 @@ impl<S: PackageStore> Resolver<S> {
             ));
         };
 
-        let mut sigs = def.parameters.clone();
-
         // (1). Fetch all the information from this store that is necessary to resolve types
         // referenced by this tag.
-        for sig in &sigs {
+        for sig in def.parameters.iter().chain(def.return_.iter()) {
             context
                 .add_signature(
                     sig.body.clone(),
@@ -431,11 +457,11 @@ impl<S: PackageStore> Resolver<S> {
         }
 
         // (2). Use that information to relocate package IDs in the signature.
-        for sig in &mut sigs {
+        for sig in def.parameters.iter_mut().chain(def.return_.iter_mut()) {
             context.relocate_signature(&mut sig.body)?;
         }
 
-        Ok(sigs)
+        Ok(def)
     }
 
     /// Attempts to infer the type layouts for pure inputs to the programmable transaction.
@@ -454,27 +480,29 @@ impl<S: PackageStore> Resolver<S> {
         let mut tags = vec![None; tx.inputs.len()];
         let mut register_type = |arg: &Argument, tag: &TypeTag| {
             let &Argument::Input(ix) = arg else {
-                return Ok(());
+                return;
             };
 
             if !matches!(tx.inputs.get(ix as usize), Some(CallArg::Pure(_))) {
-                return Ok(());
+                return;
             }
 
             let Some(type_) = tags.get_mut(ix as usize) else {
-                return Ok(());
+                return;
             };
 
+            // Types are initially `None`, and are set to `Some(Ok(_))` as long as the input can be
+            // mapped to a unique type, and to `Some(Err(()))` if the input is used with
+            // conflicting types at some point.
             match type_ {
-                None => *type_ = Some(tag.clone()),
-                Some(prev) => {
+                None => *type_ = Some(Ok(tag.clone())),
+                Some(Err(())) => {}
+                Some(Ok(prev)) => {
                     if prev != tag {
-                        return Err(Error::InputTypeConflict(ix, prev.clone(), tag.clone()));
+                        *type_ = Some(Err(()));
                     }
                 }
             }
-
-            Ok(())
         };
 
         // (1). Infer type tags for pure inputs from their uses.
@@ -482,30 +510,34 @@ impl<S: PackageStore> Resolver<S> {
             match cmd {
                 Command::MoveCall(call) => {
                     let params = self
-                        .function_parameters(
+                        .function_signature(
                             call.package.into(),
                             call.module.as_str(),
                             call.function.as_str(),
                         )
-                        .await?;
+                        .await?
+                        .parameters;
 
                     for (open_sig, arg) in params.iter().zip(call.arguments.iter()) {
                         let sig = open_sig.instantiate(&call.type_arguments)?;
-                        register_type(arg, &sig.body)?;
+                        register_type(arg, &sig.body);
                     }
                 }
 
-                Command::TransferObjects(_, arg) => register_type(arg, &TypeTag::Address)?,
+                Command::TransferObjects(_, arg) => register_type(arg, &TypeTag::Address),
 
                 Command::SplitCoins(_, amounts) => {
                     for amount in amounts {
-                        register_type(amount, &TypeTag::U64)?;
+                        register_type(amount, &TypeTag::U64);
                     }
                 }
 
-                Command::MakeMoveVec(Some(tag), elems) if is_primitive_type_tag(tag) => {
-                    for elem in elems {
-                        register_type(elem, tag)?;
+                Command::MakeMoveVec(Some(tag), elems) => {
+                    let tag = as_type_tag(tag)?;
+                    if is_primitive_type_tag(&tag) {
+                        for elem in elems {
+                            register_type(elem, &tag);
+                        }
                     }
                 }
 
@@ -515,7 +547,11 @@ impl<S: PackageStore> Resolver<S> {
 
         // (2). Gather all the unique type tags to convert into layouts. There are relatively few
         // primitive types so this is worth doing to avoid redundant work.
-        let unique_tags: BTreeSet<_> = tags.iter().filter_map(|t| t.clone()).collect();
+        let unique_tags: BTreeSet<_> = tags
+            .iter()
+            .flat_map(|t| t.clone())
+            .flat_map(|t| t.ok())
+            .collect();
 
         // (3). Convert the type tags into layouts.
         let mut layouts = BTreeMap::new();
@@ -527,7 +563,11 @@ impl<S: PackageStore> Resolver<S> {
         // (4) Prepare the result vector.
         Ok(tags
             .iter()
-            .map(|t| t.as_ref().and_then(|t| layouts.get(t).cloned()))
+            .map(|t| -> Option<_> {
+                let t = t.as_ref()?;
+                let t = t.as_ref().ok()?;
+                layouts.get(t).cloned()
+            })
             .collect())
     }
 
@@ -1027,7 +1067,7 @@ impl OpenSignature {
     /// parameters. This function does not check that the supplied type parameters are valid (meet
     /// the ability constraints of the struct or function this signature is part of), but will
     /// produce an error if the signature references a type parameter that is out of bounds.
-    pub fn instantiate(&self, type_params: &[TypeTag]) -> Result<Signature> {
+    pub fn instantiate(&self, type_params: &[TypeInput]) -> Result<Signature> {
         Ok(Signature {
             ref_: self.ref_,
             body: self.body.instantiate(type_params)?,
@@ -1070,7 +1110,7 @@ impl OpenSignatureBody {
         })
     }
 
-    fn instantiate(&self, type_params: &[TypeTag]) -> Result<TypeTag> {
+    fn instantiate(&self, type_params: &[TypeInput]) -> Result<TypeTag> {
         use OpenSignatureBody as O;
         use TypeTag as T;
 
@@ -1095,15 +1135,16 @@ impl OpenSignatureBody {
                     .collect::<Result<_>>()?,
             })),
 
-            O::TypeParameter(ix) => type_params
-                .get(*ix as usize)
-                .cloned()
-                .ok_or_else(|| Error::TypeParamOOB(*ix, type_params.len()))?,
+            O::TypeParameter(ix) => as_type_tag(
+                type_params
+                    .get(*ix as usize)
+                    .ok_or_else(|| Error::TypeParamOOB(*ix, type_params.len()))?,
+            )?,
         })
     }
 }
 
-impl<'m, 'n> DatatypeRef<'m, 'n> {
+impl DatatypeRef<'_, '_> {
     pub fn as_key(&self) -> DatatypeKey {
         DatatypeKey {
             package: self.package,
@@ -1344,6 +1385,36 @@ impl<'l> ResolutionContext<'l> {
         Ok(())
     }
 
+    /// Translate runtime IDs in a type `tag` into defining IDs using only the information
+    /// contained in this context. Requires that the necessary information was added to the context
+    /// through calls to `add_type_tag`.
+    fn canonicalize_type(&self, tag: &mut TypeTag) -> Result<()> {
+        use TypeTag as T;
+
+        match tag {
+            T::Signer => return Err(Error::UnexpectedSigner),
+            T::Address | T::Bool | T::U8 | T::U16 | T::U32 | T::U64 | T::U128 | T::U256 => {
+                /* nop */
+            }
+
+            T::Vector(tag) => self.canonicalize_type(tag.as_mut())?,
+
+            T::Struct(s) => {
+                for tag in &mut s.type_params {
+                    self.canonicalize_type(tag)?;
+                }
+
+                // SAFETY: `add_type_tag` ensures `datatyps` has an element with this key.
+                let key = DatatypeRef::from(s.as_ref());
+                let def = &self.datatypes[&key];
+
+                s.address = def.defining_id;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Translate a type `tag` into its layout using only the information contained in this context.
     /// Requires that the necessary information was added to the context through calls to
     /// `add_type_tag` and `add_signature` before being called.
@@ -1399,7 +1470,7 @@ impl<'l> ResolutionContext<'l> {
                     .type_params
                     .iter()
                     // Reduce the max depth because we know these type parameters will be nested
-                    // wthin this struct.
+                    // within this struct.
                     .map(|tag| self.resolve_type_layout(tag, max_depth - 1))
                     .collect::<Result<Vec<_>>>()?;
 
@@ -1455,7 +1526,7 @@ impl<'l> ResolutionContext<'l> {
                 (
                     MoveTypeLayout::Struct(Box::new(MoveStructLayout {
                         type_,
-                        fields: Box::new(resolved_fields),
+                        fields: resolved_fields,
                     })),
                     field_depth + 1,
                 )
@@ -1668,6 +1739,38 @@ fn ident(s: &str) -> Result<Identifier> {
     Identifier::new(s).map_err(|_| Error::NotAnIdentifier(s.to_string()))
 }
 
+pub fn as_type_tag(type_input: &TypeInput) -> Result<TypeTag> {
+    use TypeInput as I;
+    use TypeTag as T;
+    Ok(match type_input {
+        I::Bool => T::Bool,
+        I::U8 => T::U8,
+        I::U16 => T::U16,
+        I::U32 => T::U32,
+        I::U64 => T::U64,
+        I::U128 => T::U128,
+        I::U256 => T::U256,
+        I::Address => T::Address,
+        I::Signer => T::Signer,
+        I::Vector(t) => T::Vector(Box::new(as_type_tag(t)?)),
+        I::Struct(s) => {
+            let StructInput {
+                address,
+                module,
+                name,
+                type_params,
+            } = s.as_ref();
+            let type_params = type_params.iter().map(as_type_tag).collect::<Result<_>>()?;
+            T::Struct(Box::new(StructTag {
+                address: *address,
+                module: ident(module)?,
+                name: ident(name)?,
+                type_params,
+            }))
+        }
+    })
+}
+
 /// Read and deserialize a signature index (from function parameter or return types) into a vector
 /// of signatures.
 fn read_signature(idx: SignatureIndex, bytecode: &CompiledModule) -> Result<Vec<OpenSignature>> {
@@ -1689,7 +1792,7 @@ mod tests {
     use std::sync::Arc;
     use std::{path::PathBuf, str::FromStr, sync::RwLock};
     use sui_types::base_types::random_object_ref;
-    use sui_types::transaction::{ObjectArg, ProgrammableMoveCall};
+    use sui_types::transaction::ObjectArg;
 
     use move_compiler::compiled_unit::NamedCompiledModule;
     use sui_move_build::{BuildConfig, CompiledPackage};
@@ -1700,9 +1803,90 @@ mod tests {
         format!("struct:\n{struct_layout:#}\n\nenum:\n{enum_layout:#}",)
     }
 
+    #[tokio::test]
+    async fn test_simple_canonical_type() {
+        let (_, cache) = package_cache([(1, build_package("a0"), a0_types())]);
+        let package_resolver = Resolver::new(cache);
+
+        let input = type_("0xa0::m::T0");
+        let expect = input.clone();
+        let actual = package_resolver.canonical_type(input).await.unwrap();
+        assert_eq!(expect, actual);
+    }
+
+    #[tokio::test]
+    async fn test_upgraded_canonical_type() {
+        let (_, cache) = package_cache([
+            (1, build_package("a0"), a0_types()),
+            (2, build_package("a1"), a1_types()),
+        ]);
+
+        let package_resolver = Resolver::new(cache);
+
+        let input = type_("0xa1::m::T3");
+        let expect = input.clone();
+        let actual = package_resolver.canonical_type(input).await.unwrap();
+        assert_eq!(expect, actual);
+    }
+
+    #[tokio::test]
+    async fn test_latest_canonical_type() {
+        let (_, cache) = package_cache([
+            (1, build_package("a0"), a0_types()),
+            (2, build_package("a1"), a1_types()),
+        ]);
+
+        let package_resolver = Resolver::new(cache);
+
+        let input = type_("0xa1::m::T0");
+        let expect = type_("0xa0::m::T0");
+        let actual = package_resolver.canonical_type(input).await.unwrap();
+        assert_eq!(expect, actual);
+    }
+
+    #[tokio::test]
+    async fn test_type_param_canonical_type() {
+        let (_, cache) = package_cache([
+            (1, build_package("a0"), a0_types()),
+            (2, build_package("a1"), a1_types()),
+        ]);
+
+        let package_resolver = Resolver::new(cache);
+
+        let input = type_("0xa1::m::T1<0xa1::m::T0, 0xa1::m::T3>");
+        let expect = type_("0xa0::m::T1<0xa0::m::T0, 0xa1::m::T3>");
+        let actual = package_resolver.canonical_type(input).await.unwrap();
+        assert_eq!(expect, actual);
+    }
+
+    #[tokio::test]
+    async fn test_canonical_err_package_too_old() {
+        let (_, cache) = package_cache([
+            (1, build_package("a0"), a0_types()),
+            (2, build_package("a1"), a1_types()),
+        ]);
+
+        let package_resolver = Resolver::new(cache);
+
+        let input = type_("0xa0::m::T3");
+        let err = package_resolver.canonical_type(input).await.unwrap_err();
+        assert!(matches!(err, Error::DatatypeNotFound(_, _, _)));
+    }
+
+    #[tokio::test]
+    async fn test_canonical_err_signer() {
+        let (_, cache) = package_cache([(1, build_package("a0"), a0_types())]);
+
+        let package_resolver = Resolver::new(cache);
+
+        let input = type_("0xa0::m::T1<0xa0::m::T0, signer>");
+        let err = package_resolver.canonical_type(input).await.unwrap_err();
+        assert!(matches!(err, Error::UnexpectedSigner));
+    }
+
     /// Layout for a type that only refers to base types or other types in the same module.
     #[tokio::test]
-    async fn test_simple_type() {
+    async fn test_simple_type_layout() {
         let (_, cache) = package_cache([(1, build_package("a0"), a0_types())]);
         let package_resolver = Resolver::new(cache);
         let struct_layout = package_resolver
@@ -1718,7 +1902,7 @@ mod tests {
 
     /// A type that refers to types from other modules in the same package.
     #[tokio::test]
-    async fn test_cross_module() {
+    async fn test_cross_module_layout() {
         let (_, cache) = package_cache([(1, build_package("a0"), a0_types())]);
         let resolver = Resolver::new(cache);
         let struct_layout = resolver.type_layout(type_("0xa0::n::T0")).await.unwrap();
@@ -1728,7 +1912,7 @@ mod tests {
 
     /// A type that refers to types a different package.
     #[tokio::test]
-    async fn test_cross_package() {
+    async fn test_cross_package_layout() {
         let (_, cache) = package_cache([
             (1, build_package("a0"), a0_types()),
             (1, build_package("b0"), b0_types()),
@@ -1743,7 +1927,7 @@ mod tests {
     /// A type from an upgraded package, mixing structs defined in the original package and the
     /// upgraded package.
     #[tokio::test]
-    async fn test_upgraded_package() {
+    async fn test_upgraded_package_layout() {
         let (_, cache) = package_cache([
             (1, build_package("a0"), a0_types()),
             (2, build_package("a1"), a1_types()),
@@ -1758,7 +1942,7 @@ mod tests {
     /// A generic type instantiation where the type parameters are resolved relative to linkage
     /// contexts from different versions of the same package.
     #[tokio::test]
-    async fn test_multiple_linkage_contexts() {
+    async fn test_multiple_linkage_contexts_layout() {
         let (_, cache) = package_cache([
             (1, build_package("a0"), a0_types()),
             (2, build_package("a1"), a1_types()),
@@ -1781,7 +1965,7 @@ mod tests {
     /// type can be referred to using the ID of any package that declares it, rather than only the
     /// package that first declared it (whose ID is its defining ID).
     #[tokio::test]
-    async fn test_upgraded_package_non_defining_id() {
+    async fn test_upgraded_package_non_defining_id_layout() {
         let (_, cache) = package_cache([
             (1, build_package("a0"), a0_types()),
             (2, build_package("a1"), a1_types()),
@@ -1803,7 +1987,7 @@ mod tests {
     /// dependency on A from v1 to v2.  The type in C refers to types that were defined in both B, A
     /// v1, and A v2.
     #[tokio::test]
-    async fn test_relinking() {
+    async fn test_relinking_layout() {
         let (_, cache) = package_cache([
             (1, build_package("a0"), a0_types()),
             (2, build_package("a1"), a1_types()),
@@ -1818,7 +2002,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_value_nesting_boundary() {
+    async fn test_value_nesting_boundary_layout() {
         let (_, cache) = package_cache([(1, build_package("a0"), a0_types())]);
 
         let resolver = Resolver::new_with_limits(
@@ -1844,7 +2028,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_err_value_nesting_simple() {
+    async fn test_err_value_nesting_simple_layout() {
         let (_, cache) = package_cache([(1, build_package("a0"), a0_types())]);
 
         let resolver = Resolver::new_with_limits(
@@ -1871,7 +2055,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_err_value_nesting_big_type_param() {
+    async fn test_err_value_nesting_big_type_param_layout() {
         let (_, cache) = package_cache([(1, build_package("a0"), a0_types())]);
 
         let resolver = Resolver::new_with_limits(
@@ -1899,7 +2083,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_err_value_nesting_big_phantom_type_param() {
+    async fn test_err_value_nesting_big_phantom_type_param_layout() {
         let (_, cache) = package_cache([
             (1, build_package("sui"), sui_types()),
             (1, build_package("d0"), d0_types()),
@@ -1941,7 +2125,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_err_value_nesting_type_param_application() {
+    async fn test_err_value_nesting_type_param_application_layout() {
         let (_, cache) = package_cache([
             (1, build_package("sui"), sui_types()),
             (1, build_package("d0"), d0_types()),
@@ -2056,7 +2240,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_err_not_a_package() {
+    async fn test_layout_err_not_a_package() {
         let (_, cache) = package_cache([(1, build_package("a0"), a0_types())]);
         let resolver = Resolver::new(cache);
         let err = resolver
@@ -2067,7 +2251,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_err_no_module() {
+    async fn test_layout_err_no_module() {
         let (_, cache) = package_cache([(1, build_package("a0"), a0_types())]);
         let resolver = Resolver::new(cache);
         let err = resolver
@@ -2078,7 +2262,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_err_no_struct() {
+    async fn test_layout_err_no_struct() {
         let (_, cache) = package_cache([(1, build_package("a0"), a0_types())]);
         let resolver = Resolver::new(cache);
 
@@ -2090,7 +2274,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_err_type_arity() {
+    async fn test_layout_err_type_arity() {
         let (_, cache) = package_cache([(1, build_package("a0"), a0_types())]);
         let resolver = Resolver::new(cache);
 
@@ -2229,9 +2413,9 @@ mod tests {
         let resolver = Resolver::new(cache);
         let c0 = addr("0xc0");
 
-        let foo = resolver.function_parameters(c0, "m", "foo").await.unwrap();
-        let bar = resolver.function_parameters(c0, "m", "bar").await.unwrap();
-        let baz = resolver.function_parameters(c0, "m", "baz").await.unwrap();
+        let foo = resolver.function_signature(c0, "m", "foo").await.unwrap();
+        let bar = resolver.function_signature(c0, "m", "bar").await.unwrap();
+        let baz = resolver.function_signature(c0, "m", "baz").await.unwrap();
 
         insta::assert_snapshot!(format!(
             "c0::m::foo: {foo:#?}\n\
@@ -2243,7 +2427,7 @@ mod tests {
     #[tokio::test]
     async fn test_signature_instantiation() {
         use OpenSignatureBody as O;
-        use TypeTag as T;
+        use TypeInput as T;
 
         let sig = O::Datatype(
             key("0x2::table::Table"),
@@ -2262,7 +2446,7 @@ mod tests {
     #[tokio::test]
     async fn test_signature_instantiation_error() {
         use OpenSignatureBody as O;
-        use TypeTag as T;
+        use TypeInput as T;
 
         let sig = O::Datatype(
             key("0x2::table::Table"),
@@ -2275,7 +2459,7 @@ mod tests {
             ],
         );
 
-        insta::assert_display_snapshot!(
+        insta::assert_snapshot!(
             sig.instantiate(&[T::U64, T::Bool]).unwrap_err(),
             @"Type Parameter 99 out of bounds (2)"
         );
@@ -2571,13 +2755,13 @@ mod tests {
                     I::Pure(bcs::to_bytes("hello").unwrap()),
                     I::Pure(bcs::to_bytes("world").unwrap()),
                 ],
-                commands: vec![Command::MoveCall(Box::new(ProgrammableMoveCall {
-                    package: addr("0xe0").into(),
-                    module: ident_str!("m").to_owned(),
-                    function: ident_str!("foo").to_owned(),
-                    type_arguments: vec![t],
-                    arguments: (0..=6).map(Argument::Input).collect(),
-                }))],
+                commands: vec![Command::move_call(
+                    addr("0xe0").into(),
+                    ident_str!("m").to_owned(),
+                    ident_str!("foo").to_owned(),
+                    vec![t],
+                    (0..=6).map(Argument::Input).collect(),
+                )],
             }
         }
 
@@ -2651,20 +2835,20 @@ mod tests {
                 I::Pure(bcs::to_bytes("world").unwrap()),
             ],
             commands: vec![
-                Command::MoveCall(Box::new(ProgrammableMoveCall {
-                    package: addr("0xe0").into(),
-                    module: ident_str!("m").to_owned(),
-                    function: ident_str!("foo").to_owned(),
-                    type_arguments: vec![T::U64],
-                    arguments: (0..=6).map(Argument::Input).collect(),
-                })),
-                Command::MoveCall(Box::new(ProgrammableMoveCall {
-                    package: addr("0xe0").into(),
-                    module: ident_str!("m").to_owned(),
-                    function: ident_str!("foo").to_owned(),
-                    type_arguments: vec![T::U64],
-                    arguments: (0..=6).map(Argument::Input).collect(),
-                })),
+                Command::move_call(
+                    addr("0xe0").into(),
+                    ident_str!("m").to_owned(),
+                    ident_str!("foo").to_owned(),
+                    vec![T::U64],
+                    (0..=6).map(Argument::Input).collect(),
+                ),
+                Command::move_call(
+                    addr("0xe0").into(),
+                    ident_str!("m").to_owned(),
+                    ident_str!("foo").to_owned(),
+                    vec![T::U64],
+                    (0..=6).map(Argument::Input).collect(),
+                ),
             ],
         };
 
@@ -2687,6 +2871,7 @@ mod tests {
     async fn test_pure_input_layouts_conflicting() {
         use CallArg as I;
         use ObjectArg::ImmOrOwnedObject as O;
+        use TypeInput as TI;
         use TypeTag as T;
 
         let (_, cache) = package_cache([
@@ -2708,23 +2893,32 @@ mod tests {
                 I::Pure(bcs::to_bytes("world").unwrap()),
             ],
             commands: vec![
-                Command::MoveCall(Box::new(ProgrammableMoveCall {
-                    package: addr("0xe0").into(),
-                    module: ident_str!("m").to_owned(),
-                    function: ident_str!("foo").to_owned(),
-                    type_arguments: vec![T::U64],
-                    arguments: (0..=6).map(Argument::Input).collect(),
-                })),
+                Command::move_call(
+                    addr("0xe0").into(),
+                    ident_str!("m").to_owned(),
+                    ident_str!("foo").to_owned(),
+                    vec![T::U64],
+                    (0..=6).map(Argument::Input).collect(),
+                ),
                 // This command is using the input that was previously used as a U64, but now as a
                 // U32, which will cause an error.
-                Command::MakeMoveVec(Some(T::U32), vec![Argument::Input(3)]),
+                Command::MakeMoveVec(Some(TI::U32), vec![Argument::Input(3)]),
             ],
         };
 
-        insta::assert_display_snapshot!(
-            resolver.pure_input_layouts(&ptb).await.unwrap_err(),
-            @"Conflicting types for input 3: u64 and u32"
-        );
+        let inputs = resolver.pure_input_layouts(&ptb).await.unwrap();
+
+        // Make the output format a little nicer for the snapshot
+        let mut output = String::new();
+        for input in inputs {
+            if let Some(layout) = input {
+                output += &format!("{layout:#}\n");
+            } else {
+                output += "???\n";
+            }
+        }
+
+        insta::assert_snapshot!(output);
     }
 
     /***** Test Helpers ***************************************************************************/

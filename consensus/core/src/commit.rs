@@ -19,6 +19,7 @@ use crate::{
     block::{BlockAPI, BlockRef, BlockTimestampMs, Round, Slot, VerifiedBlock},
     leader_scoring::ReputationScores,
     storage::Store,
+    TransactionIndex,
 };
 
 /// Index of a commit among all consensus commits.
@@ -109,6 +110,7 @@ pub(crate) struct CommitV1 {
     leader: BlockRef,
     /// Refs to committed blocks, in the commit order.
     blocks: Vec<BlockRef>,
+    // TODO(fastpath): record rejected transactions.
 }
 
 impl CommitAPI for CommitV1 {
@@ -205,6 +207,56 @@ impl Deref for TrustedCommit {
     }
 }
 
+/// `CertifiedCommits` keeps the synchronized certified commits along with the corresponding votes received from the peer that provided these commits.
+/// The `votes` contain the blocks as those provided by the peer, and certify the tip of the synced commits.
+#[derive(Clone, Debug)]
+pub(crate) struct CertifiedCommits {
+    commits: Vec<CertifiedCommit>,
+    votes: Vec<VerifiedBlock>,
+}
+
+impl CertifiedCommits {
+    pub(crate) fn new(commits: Vec<CertifiedCommit>, votes: Vec<VerifiedBlock>) -> Self {
+        Self { commits, votes }
+    }
+
+    pub(crate) fn commits(&self) -> &[CertifiedCommit] {
+        &self.commits
+    }
+
+    pub(crate) fn votes(&self) -> &[VerifiedBlock] {
+        &self.votes
+    }
+}
+
+/// A commit that has been synced and certified by a quorum of authorities.
+#[derive(Clone, Debug)]
+pub(crate) struct CertifiedCommit {
+    commit: Arc<TrustedCommit>,
+    blocks: Vec<VerifiedBlock>,
+}
+
+impl CertifiedCommit {
+    pub(crate) fn new_certified(commit: TrustedCommit, blocks: Vec<VerifiedBlock>) -> Self {
+        Self {
+            commit: Arc::new(commit),
+            blocks,
+        }
+    }
+
+    pub fn blocks(&self) -> &[VerifiedBlock] {
+        &self.blocks
+    }
+}
+
+impl Deref for CertifiedCommit {
+    type Target = TrustedCommit;
+
+    fn deref(&self) -> &Self::Target {
+        &self.commit
+    }
+}
+
 /// Digest of a consensus commit.
 #[derive(Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CommitDigest([u8; consensus_config::DIGEST_LENGTH]);
@@ -291,8 +343,11 @@ pub type CommitVote = CommitRef;
 pub struct CommittedSubDag {
     /// A reference to the leader of the sub-dag
     pub leader: BlockRef,
+    // TODO: refactor blocks and rejected_transactions_by_block to CertifiedBlock.
     /// All the committed blocks that are part of this sub-dag
     pub blocks: Vec<VerifiedBlock>,
+    /// Indices of rejected transactions in each block.
+    pub rejected_transactions_by_block: Vec<Vec<TransactionIndex>>,
     /// The timestamp of the commit, obtained from the timestamp of the leader block.
     pub timestamp_ms: BlockTimestampMs,
     /// The reference of the commit.
@@ -309,13 +364,16 @@ impl CommittedSubDag {
     pub fn new(
         leader: BlockRef,
         blocks: Vec<VerifiedBlock>,
+        rejected_transactions_by_block: Vec<Vec<TransactionIndex>>,
         timestamp_ms: BlockTimestampMs,
         commit_ref: CommitRef,
         reputation_scores_desc: Vec<(AuthorityIndex, u64)>,
     ) -> Self {
+        assert_eq!(blocks.len(), rejected_transactions_by_block.len());
         Self {
             leader,
             blocks,
+            rejected_transactions_by_block,
             timestamp_ms,
             commit_ref,
             reputation_scores_desc,
@@ -386,11 +444,14 @@ pub fn load_committed_subdag_from_store(
             commit_block
         })
         .collect::<Vec<_>>();
+    // TODO(fastpath): recover rejected transaction indices from commit.
+    let rejected_transactions = vec![vec![]; blocks.len()];
     let leader_block_idx = leader_block_idx.expect("Leader block must be in the sub-dag");
     let leader_block_ref = blocks[leader_block_idx].reference();
     CommittedSubDag::new(
         leader_block_ref,
         blocks,
+        rejected_transactions,
         commit.timestamp_ms(),
         commit.reference(),
         reputation_scores_desc,
@@ -401,6 +462,7 @@ pub fn load_committed_subdag_from_store(
 pub(crate) enum Decision {
     Direct,
     Indirect,
+    Certified, // This is a commit certified leader so no commit decision was made locally.
 }
 
 /// The status of a leader slot from the direct and indirect commit rules.
@@ -506,16 +568,6 @@ impl Display for DecidedLeader {
 pub(crate) struct CommitInfo {
     pub(crate) committed_rounds: Vec<Round>,
     pub(crate) reputation_scores: ReputationScores,
-}
-
-impl CommitInfo {
-    // Returns a new CommitInfo.
-    pub(crate) fn new(committed_rounds: Vec<Round>, reputation_scores: ReputationScores) -> Self {
-        CommitInfo {
-            committed_rounds,
-            reputation_scores,
-        }
-    }
 }
 
 /// CommitRange stores a range of CommitIndex. The range contains the start (inclusive)

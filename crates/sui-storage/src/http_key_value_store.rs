@@ -16,9 +16,7 @@ use sui_types::base_types::{ObjectID, SequenceNumber, VersionNumber};
 use sui_types::object::Object;
 use sui_types::storage::ObjectKey;
 use sui_types::{
-    digests::{
-        CheckpointContentsDigest, CheckpointDigest, TransactionDigest, TransactionEventsDigest,
-    },
+    digests::{CheckpointContentsDigest, CheckpointDigest, TransactionDigest},
     effects::{TransactionEffects, TransactionEffectsAPI, TransactionEvents},
     error::{SuiError, SuiResult},
     messages_checkpoint::{
@@ -26,7 +24,7 @@ use sui_types::{
     },
     transaction::Transaction,
 };
-use tap::TapFallible;
+use tap::{TapFallible, TapOptional};
 use tracing::{error, info, instrument, trace, warn};
 
 use crate::key_value_store::{TransactionKeyValueStore, TransactionKeyValueStoreTrait};
@@ -77,13 +75,52 @@ where
 pub enum Key {
     Tx(TransactionDigest),
     Fx(TransactionDigest),
-    Events(TransactionEventsDigest),
     CheckpointContents(CheckpointSequenceNumber),
     CheckpointSummary(CheckpointSequenceNumber),
     CheckpointContentsByDigest(CheckpointContentsDigest),
     CheckpointSummaryByDigest(CheckpointDigest),
     TxToCheckpoint(TransactionDigest),
     ObjectKey(ObjectID, VersionNumber),
+    EventsByTxDigest(TransactionDigest),
+}
+
+impl Key {
+    /// Return a string representation of the key type
+    pub fn ty(&self) -> &'static str {
+        match self {
+            Key::Tx(_) => "tx",
+            Key::Fx(_) => "fx",
+            Key::CheckpointContents(_) => "cc",
+            Key::CheckpointSummary(_) => "cs",
+            Key::CheckpointContentsByDigest(_) => "cc",
+            Key::CheckpointSummaryByDigest(_) => "cs",
+            Key::TxToCheckpoint(_) => "tx2c",
+            Key::ObjectKey(_, _) => "ob",
+            Key::EventsByTxDigest(_) => "evtx",
+        }
+    }
+
+    pub fn encode(&self) -> String {
+        match self {
+            Key::Tx(digest) => encode_digest(digest),
+            Key::Fx(digest) => encode_digest(digest),
+            Key::CheckpointContents(seq) => {
+                encoded_tagged_key(&TaggedKey::CheckpointSequenceNumber(*seq))
+            }
+            Key::CheckpointSummary(seq) => {
+                encoded_tagged_key(&TaggedKey::CheckpointSequenceNumber(*seq))
+            }
+            Key::CheckpointContentsByDigest(digest) => encode_digest(digest),
+            Key::CheckpointSummaryByDigest(digest) => encode_digest(digest),
+            Key::TxToCheckpoint(digest) => encode_digest(digest),
+            Key::ObjectKey(object_id, version) => encode_object_key(object_id, version),
+            Key::EventsByTxDigest(digest) => encode_digest(digest),
+        }
+    }
+
+    pub fn to_path_elements(&self) -> (String, &'static str) {
+        (self.encode(), self.ty())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -96,35 +133,12 @@ enum Value {
     TxToCheckpoint(CheckpointSequenceNumber),
 }
 
-pub fn key_to_path_elements(key: &Key) -> SuiResult<(String, &'static str)> {
-    match key {
-        Key::Tx(digest) => Ok((encode_digest(digest), "tx")),
-        Key::Fx(digest) => Ok((encode_digest(digest), "fx")),
-        Key::Events(digest) => Ok((encode_digest(digest), "ev")),
-        Key::CheckpointContents(seq) => Ok((
-            encoded_tagged_key(&TaggedKey::CheckpointSequenceNumber(*seq)),
-            "cc",
-        )),
-        Key::CheckpointSummary(seq) => Ok((
-            encoded_tagged_key(&TaggedKey::CheckpointSequenceNumber(*seq)),
-            "cs",
-        )),
-        Key::CheckpointContentsByDigest(digest) => Ok((encode_digest(digest), "cc")),
-        Key::CheckpointSummaryByDigest(digest) => Ok((encode_digest(digest), "cs")),
-        Key::TxToCheckpoint(digest) => Ok((encode_digest(digest), "tx2c")),
-        Key::ObjectKey(object_id, version) => Ok((encode_object_key(object_id, version), "ob")),
-    }
-}
-
 pub fn path_elements_to_key(digest: &str, type_: &str) -> anyhow::Result<Key> {
     let decoded_digest = base64_url::decode(digest)?;
 
     match type_ {
         "tx" => Ok(Key::Tx(TransactionDigest::try_from(decoded_digest)?)),
         "fx" => Ok(Key::Fx(TransactionDigest::try_from(decoded_digest)?)),
-        "ev" => Ok(Key::Events(TransactionEventsDigest::try_from(
-            decoded_digest,
-        )?)),
         "cc" => {
             // first try to decode as digest, otherwise try to decode as tagged key
             match CheckpointContentsDigest::try_from(decoded_digest.clone()) {
@@ -202,7 +216,7 @@ impl HttpKVStore {
     }
 
     fn get_url(&self, key: &Key) -> SuiResult<Url> {
-        let (digest, item_type) = key_to_path_elements(key)?;
+        let (digest, item_type) = key.to_path_elements();
         let joined = self
             .base_url
             .join(&format!("{}/{}", digest, item_type))
@@ -225,14 +239,14 @@ impl HttpKVStore {
             trace!("found cached data for url: {}, len: {:?}", url, res.len());
             self.metrics
                 .key_value_store_num_fetches_success
-                .with_label_values(&["http_cache", "url"])
+                .with_label_values(&["http_cache", key.ty()])
                 .inc();
             return Ok(Some(res));
         }
 
         self.metrics
             .key_value_store_num_fetches_not_found
-            .with_label_values(&["http_cache", "url"])
+            .with_label_values(&["http_cache", key.ty()])
             .inc();
 
         let resp = self
@@ -329,27 +343,19 @@ impl TransactionKeyValueStoreTrait for HttpKVStore {
         &self,
         transactions: &[TransactionDigest],
         effects: &[TransactionDigest],
-        events: &[TransactionEventsDigest],
-    ) -> SuiResult<(
-        Vec<Option<Transaction>>,
-        Vec<Option<TransactionEffects>>,
-        Vec<Option<TransactionEvents>>,
-    )> {
+    ) -> SuiResult<(Vec<Option<Transaction>>, Vec<Option<TransactionEffects>>)> {
         let num_txns = transactions.len();
         let num_effects = effects.len();
-        let num_events = events.len();
 
         let keys = transactions
             .iter()
             .map(|tx| Key::Tx(*tx))
             .chain(effects.iter().map(|fx| Key::Fx(*fx)))
-            .chain(events.iter().map(|events| Key::Events(*events)))
             .collect::<Vec<_>>();
 
         let fetches = self.multi_fetch(keys).await;
         let txn_slice = fetches[..num_txns].to_vec();
         let fx_slice = fetches[num_txns..num_txns + num_effects].to_vec();
-        let events_slice = fetches[num_txns + num_effects..].to_vec();
 
         let txn_results = txn_slice
             .iter()
@@ -376,20 +382,7 @@ impl TransactionKeyValueStoreTrait for HttpKVStore {
                 })
             })
             .collect::<Vec<_>>();
-
-        let events_results = events_slice
-            .iter()
-            .take(num_events)
-            .zip(events.iter())
-            .map(map_fetch)
-            .map(|maybe_bytes| {
-                maybe_bytes.and_then(|(bytes, digest)| {
-                    deser_check_digest(digest, bytes, |events: &TransactionEvents| events.digest())
-                })
-            })
-            .collect::<Vec<_>>();
-
-        Ok((txn_results, fx_results, events_results))
+        Ok((txn_results, fx_results))
     }
 
     #[instrument(level = "trace", skip_all)]
@@ -398,12 +391,10 @@ impl TransactionKeyValueStoreTrait for HttpKVStore {
         checkpoint_summaries: &[CheckpointSequenceNumber],
         checkpoint_contents: &[CheckpointSequenceNumber],
         checkpoint_summaries_by_digest: &[CheckpointDigest],
-        checkpoint_contents_by_digest: &[CheckpointContentsDigest],
     ) -> SuiResult<(
         Vec<Option<CertifiedCheckpointSummary>>,
         Vec<Option<CheckpointContents>>,
         Vec<Option<CertifiedCheckpointSummary>>,
-        Vec<Option<CheckpointContents>>,
     )> {
         let keys = checkpoint_summaries
             .iter()
@@ -418,26 +409,15 @@ impl TransactionKeyValueStoreTrait for HttpKVStore {
                     .iter()
                     .map(|cp| Key::CheckpointSummaryByDigest(*cp)),
             )
-            .chain(
-                checkpoint_contents_by_digest
-                    .iter()
-                    .map(|cp| Key::CheckpointContentsByDigest(*cp)),
-            )
             .collect::<Vec<_>>();
 
         let summaries_len = checkpoint_summaries.len();
         let contents_len = checkpoint_contents.len();
         let summaries_by_digest_len = checkpoint_summaries_by_digest.len();
-        let contents_by_digest_len = checkpoint_contents_by_digest.len();
 
         let fetches = self.multi_fetch(keys).await;
 
-        let input_slices = [
-            summaries_len,
-            contents_len,
-            summaries_by_digest_len,
-            contents_by_digest_len,
-        ];
+        let input_slices = [summaries_len, contents_len, summaries_by_digest_len];
 
         let result_slices = multi_split_slice(&fetches, &input_slices);
 
@@ -470,23 +450,10 @@ impl TransactionKeyValueStoreTrait for HttpKVStore {
                 })
             })
             .collect::<Vec<_>>();
-
-        let contents_by_digest_results = result_slices[3]
-            .iter()
-            .zip(checkpoint_contents_by_digest.iter())
-            .map(map_fetch)
-            .map(|maybe_bytes| {
-                maybe_bytes.and_then(|(bytes, digest)| {
-                    deser_check_digest(digest, bytes, |c: &CheckpointContents| *c.digest())
-                })
-            })
-            .collect::<Vec<_>>();
-
         Ok((
             summaries_results,
             contents_results,
             summaries_by_digest_results,
-            contents_by_digest_results,
         ))
     }
 
@@ -508,9 +475,22 @@ impl TransactionKeyValueStoreTrait for HttpKVStore {
         version: SequenceNumber,
     ) -> SuiResult<Option<Object>> {
         let key = Key::ObjectKey(object_id, version);
-        self.fetch(key)
-            .await
-            .map(|maybe| maybe.and_then(|bytes| deser::<_, Object>(&key, bytes.as_ref())))
+        self.fetch(key).await.map(|maybe| {
+            maybe
+                .and_then(|bytes| deser::<_, Object>(&key, bytes.as_ref()))
+                .tap_some(|_| {
+                    self.metrics
+                        .key_value_store_num_fetches_success
+                        .with_label_values(&["http", key.ty()])
+                        .inc();
+                })
+                .tap_none(|| {
+                    self.metrics
+                        .key_value_store_num_fetches_not_found
+                        .with_label_values(&["http", key.ty()])
+                        .inc();
+                })
+        })
     }
 
     #[instrument(level = "trace", skip_all)]
@@ -536,5 +516,27 @@ impl TransactionKeyValueStoreTrait for HttpKVStore {
             .collect::<Vec<_>>();
 
         Ok(results)
+    }
+
+    #[instrument(level = "trace", skip_all)]
+    async fn multi_get_events_by_tx_digests(
+        &self,
+        digests: &[TransactionDigest],
+    ) -> SuiResult<Vec<Option<TransactionEvents>>> {
+        let keys = digests
+            .iter()
+            .map(|digest| Key::EventsByTxDigest(*digest))
+            .collect::<Vec<_>>();
+        Ok(self
+            .multi_fetch(keys)
+            .await
+            .iter()
+            .zip(digests.iter())
+            .map(map_fetch)
+            .map(|maybe_bytes| {
+                maybe_bytes
+                    .and_then(|(bytes, key)| deser::<_, TransactionEvents>(&key, &bytes.slice(1..)))
+            })
+            .collect::<Vec<_>>())
     }
 }

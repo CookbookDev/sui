@@ -4,8 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use move_binary_format::{
-    compatibility::{Compatibility, InclusionCheck},
-    file_format::AbilitySet,
+    compatibility::{self, Compatibility, InclusionCheck},
     normalized, CompiledModule,
 };
 use sui_move_build::{BuildConfig, SuiPackageHooks};
@@ -20,11 +19,12 @@ fn run_test(path: &Path) -> datatest_stable::Result<()> {
     let base_path = pathbuf.join("base");
     let upgraded_path = pathbuf.join("upgraded");
 
+    let pool = &mut normalized::RcPool::new();
     let base = compile(&base_path)?;
-    let base_normalized = normalize(&base);
+    let base_normalized = normalize(pool, &base);
 
     let upgraded = compile(&upgraded_path)?;
-    let upgraded_normalized = normalize(&upgraded);
+    let upgraded_normalized = normalize(pool, &upgraded);
 
     check_all_compatibilities(
         base_normalized,
@@ -40,59 +40,30 @@ fn compile(path: &Path) -> anyhow::Result<Vec<CompiledModule>> {
         .into_modules())
 }
 
-fn normalize(modules: &[CompiledModule]) -> Vec<normalized::Module> {
-    modules.iter().map(normalized::Module::new).collect()
+fn normalize(
+    pool: &mut normalized::RcPool,
+    modules: &[CompiledModule],
+) -> Vec<compatibility::Module> {
+    modules
+        .iter()
+        .map(|m| compatibility::Module::new(pool, m, /* include code */ true))
+        .collect()
 }
 
 fn check_all_compatibilities(
-    base: Vec<normalized::Module>,
-    upgraded: Vec<normalized::Module>,
+    base: Vec<compatibility::Module>,
+    upgraded: Vec<compatibility::Module>,
     name: String,
 ) -> datatest_stable::Result<()> {
     assert_eq!(base.len(), upgraded.len());
 
     let compatibility_types = [
+        // Full compat skip check private entry linking
+        Compatibility::upgrade_check(),
+        // Full compat but allow any new abilities
         Compatibility::full_check(),
-        // Full compat but allow private entry functions to change
-        Compatibility {
-            check_datatype_and_pub_function_linking: true,
-            check_datatype_layout: true,
-            check_friend_linking: true,
-            check_private_entry_linking: false,
-            disallowed_new_abilities: AbilitySet::ALL,
-            disallow_change_datatype_type_params: true,
-            disallow_new_variants: true,
-        },
-        // Full compat but allow private entry functions and friends to change
-        Compatibility {
-            check_datatype_and_pub_function_linking: true,
-            check_datatype_layout: true,
-            check_friend_linking: false,
-            check_private_entry_linking: false,
-            disallowed_new_abilities: AbilitySet::ALL,
-            disallow_change_datatype_type_params: true,
-            disallow_new_variants: true,
-        },
-        // Full compat but allow friends to change
-        Compatibility {
-            check_datatype_and_pub_function_linking: true,
-            check_datatype_layout: true,
-            check_friend_linking: false,
-            check_private_entry_linking: true,
-            disallowed_new_abilities: AbilitySet::ALL,
-            disallow_change_datatype_type_params: true,
-            disallow_new_variants: true,
-        },
-        // Full compat but allow new enum variants to be added
-        Compatibility {
-            check_datatype_and_pub_function_linking: true,
-            check_datatype_layout: true,
-            check_friend_linking: true,
-            check_private_entry_linking: true,
-            disallowed_new_abilities: AbilitySet::ALL,
-            disallow_change_datatype_type_params: true,
-            disallow_new_variants: true,
-        },
+        // Full compat only disallow new key ability
+        Compatibility::framework_upgrade_check(),
         Compatibility::no_check(),
     ];
 
@@ -105,8 +76,8 @@ fn check_all_compatibilities(
                 .map(|(base, upgraded)| {
                     format!(
                         "{}::{}:\n\tbase->upgrade: {}\n\tupgrade->base: {}",
-                        base.address,
-                        base.name,
+                        base.address(),
+                        base.name(),
                         compat.check(base, upgraded).is_ok(),
                         compat.check(upgraded, base).is_ok()
                     )
@@ -131,8 +102,8 @@ fn check_all_compatibilities(
                 .map(|(base, upgraded)| {
                     format!(
                         "{}::{}:\n\tbase->upgrade: {}\n\tupgrade->base: {}",
-                        base.address,
-                        base.name,
+                        base.address(),
+                        base.name(),
                         compat.check(base, upgraded).is_ok(),
                         compat.check(upgraded, base).is_ok()
                     )
@@ -149,7 +120,7 @@ fn check_all_compatibilities(
         .join("\n");
 
     results.push_str(&inclusion_results);
-    insta::assert_display_snapshot!(name, results);
+    insta::assert_snapshot!(name, results);
     Ok(())
 }
 

@@ -8,7 +8,11 @@ use crate::{
     error::ExecutionError,
     object::{Data, Object},
 };
-use crate::{base_types::ObjectID, id::UID, SUI_FRAMEWORK_ADDRESS};
+use crate::{
+    base_types::ObjectID,
+    id::{ID, UID},
+    SUI_FRAMEWORK_ADDRESS,
+};
 use move_core_types::{
     annotated_value::{MoveFieldLayout, MoveStructLayout, MoveTypeLayout},
     ident_str,
@@ -22,6 +26,7 @@ pub const COIN_MODULE_NAME: &IdentStr = ident_str!("coin");
 pub const COIN_STRUCT_NAME: &IdentStr = ident_str!("Coin");
 pub const COIN_METADATA_STRUCT_NAME: &IdentStr = ident_str!("CoinMetadata");
 pub const COIN_TREASURE_CAP_NAME: &IdentStr = ident_str!("TreasuryCap");
+pub const REGULATED_COIN_METADATA_STRUCT_NAME: &IdentStr = ident_str!("RegulatedCoinMetadata");
 
 pub const PAY_MODULE_NAME: &IdentStr = ident_str!("pay");
 pub const PAY_JOIN_FUNC_NAME: &IdentStr = ident_str!("join");
@@ -36,9 +41,9 @@ pub struct Coin {
 }
 
 impl Coin {
-    pub fn new(id: UID, value: u64) -> Self {
+    pub fn new(id: ObjectID, value: u64) -> Self {
         Self {
-            id,
+            id: UID::new(id),
             balance: Balance::new(value),
         }
     }
@@ -59,6 +64,18 @@ impl Coin {
             && other.name.as_ident_str() == COIN_STRUCT_NAME
     }
 
+    /// Checks if the provided type is `Coin<T>`, returning the type T if so.
+    pub fn is_coin_with_coin_type(other: &StructTag) -> Option<&StructTag> {
+        if Self::is_coin(other) && other.type_params.len() == 1 {
+            match other.type_params.first() {
+                Some(TypeTag::Struct(coin_type)) => Some(coin_type),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+
     /// Create a coin from BCS bytes
     pub fn from_bcs_bytes(content: &[u8]) -> Result<Self, bcs::Error> {
         bcs::from_bytes(content)
@@ -67,18 +84,17 @@ impl Coin {
     /// If the given object is a Coin, deserialize its contents and extract the balance Ok(Some(u64)).
     /// If it's not a Coin, return Ok(None).
     /// The cost is 2 comparisons if not a coin, and deserialization if its a Coin.
-    pub fn extract_balance_if_coin(object: &Object) -> Result<Option<u64>, bcs::Error> {
-        match &object.data {
-            Data::Move(move_obj) => {
-                if !move_obj.is_coin() {
-                    return Ok(None);
-                }
+    pub fn extract_balance_if_coin(object: &Object) -> Result<Option<(TypeTag, u64)>, bcs::Error> {
+        let Data::Move(obj) = &object.data else {
+            return Ok(None);
+        };
 
-                let coin = Self::from_bcs_bytes(move_obj.contents())?;
-                Ok(Some(coin.value()))
-            }
-            _ => Ok(None), // package
-        }
+        let Some(type_) = obj.type_().coin_type_maybe() else {
+            return Ok(None);
+        };
+
+        let coin = Self::from_bcs_bytes(obj.contents())?;
+        Ok(Some((type_, coin.value())))
     }
 
     pub fn id(&self) -> &ObjectID {
@@ -96,7 +112,7 @@ impl Coin {
     pub fn layout(type_param: TypeTag) -> MoveStructLayout {
         MoveStructLayout {
             type_: Self::type_(type_param.clone()),
-            fields: Box::new(vec![
+            fields: vec![
                 MoveFieldLayout::new(
                     ident_str!("id").to_owned(),
                     MoveTypeLayout::Struct(Box::new(UID::layout())),
@@ -105,7 +121,7 @@ impl Coin {
                     ident_str!("balance").to_owned(),
                     MoveTypeLayout::Struct(Box::new(Balance::layout(type_param))),
                 ),
-            ]),
+            ],
         }
     }
 
@@ -123,7 +139,7 @@ impl Coin {
     // Split amount out of this coin to a new coin.
     // Related coin objects need to be updated in temporary_store to persist the changes,
     // including creating the coin object related to the newly created coin.
-    pub fn split(&mut self, amount: u64, new_coin_id: UID) -> Result<Coin, ExecutionError> {
+    pub fn split(&mut self, amount: u64, new_coin_id: ObjectID) -> Result<Coin, ExecutionError> {
         self.balance.withdraw(amount)?;
         Ok(Coin::new(new_coin_id, amount))
     }
@@ -264,6 +280,81 @@ impl TryFrom<&Object> for CoinMetadata {
 
         Err(SuiError::TypeError {
             error: format!("Object type is not a CoinMetadata: {:?}", object),
+        })
+    }
+}
+
+// Rust version of the Move sui::coin::RegulatedCoinMetadata type
+#[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
+pub struct RegulatedCoinMetadata {
+    pub id: UID,
+    /// The ID of the coin's CoinMetadata object.
+    pub coin_metadata_object: ID,
+    /// The ID of the coin's DenyCap object.
+    pub deny_cap_object: ID,
+}
+
+impl RegulatedCoinMetadata {
+    /// Is this other StructTag representing a CoinMetadata?
+    pub fn is_regulated_coin_metadata(other: &StructTag) -> bool {
+        other.address == SUI_FRAMEWORK_ADDRESS
+            && other.module.as_ident_str() == COIN_MODULE_NAME
+            && other.name.as_ident_str() == REGULATED_COIN_METADATA_STRUCT_NAME
+    }
+
+    /// Create a coin from BCS bytes
+    pub fn from_bcs_bytes(content: &[u8]) -> Result<Self, SuiError> {
+        bcs::from_bytes(content).map_err(|err| SuiError::ObjectDeserializationError {
+            error: format!(
+                "Unable to deserialize RegulatedCoinMetadata object: {}",
+                err
+            ),
+        })
+    }
+
+    pub fn type_(type_param: StructTag) -> StructTag {
+        StructTag {
+            address: SUI_FRAMEWORK_ADDRESS,
+            module: COIN_MODULE_NAME.to_owned(),
+            name: REGULATED_COIN_METADATA_STRUCT_NAME.to_owned(),
+            type_params: vec![TypeTag::Struct(Box::new(type_param))],
+        }
+    }
+
+    /// Checks if the provided type is `CoinMetadata<T>`, returning the type T if so.
+    pub fn is_regulated_coin_metadata_with_coin_type(other: &StructTag) -> Option<&StructTag> {
+        if Self::is_regulated_coin_metadata(other) && other.type_params.len() == 1 {
+            match other.type_params.first() {
+                Some(TypeTag::Struct(coin_type)) => Some(coin_type),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+}
+
+impl TryFrom<Object> for RegulatedCoinMetadata {
+    type Error = SuiError;
+    fn try_from(object: Object) -> Result<Self, Self::Error> {
+        TryFrom::try_from(&object)
+    }
+}
+
+impl TryFrom<&Object> for RegulatedCoinMetadata {
+    type Error = SuiError;
+    fn try_from(object: &Object) -> Result<Self, Self::Error> {
+        match &object.data {
+            Data::Move(o) => {
+                if o.type_().is_regulated_coin_metadata() {
+                    return Self::from_bcs_bytes(o.contents());
+                }
+            }
+            Data::Package(_) => {}
+        }
+
+        Err(SuiError::TypeError {
+            error: format!("Object type is not a RegulatedCoinMetadata: {:?}", object),
         })
     }
 }

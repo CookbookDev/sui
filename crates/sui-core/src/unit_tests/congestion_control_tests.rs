@@ -19,6 +19,7 @@ use move_core_types::ident_str;
 use std::sync::Arc;
 use sui_macros::{register_fail_point_arg, sim_test};
 use sui_protocol_config::{Chain, PerObjectCongestionControlMode, ProtocolConfig, ProtocolVersion};
+use sui_types::base_types::ConsensusObjectSequenceKey;
 use sui_types::digests::TransactionDigest;
 use sui_types::effects::{InputSharedObject, TransactionEffectsAPI};
 use sui_types::executable_transaction::VerifiedExecutableTransaction;
@@ -128,7 +129,7 @@ impl TestSetup {
         create_shared_object_effects.created()[0].0
     }
 
-    // Creates a owned object in `setup_authority_state` and returns the object reference.
+    // Creates an owned object in `setup_authority_state` and returns the object reference.
     async fn create_owned_object(&self) -> ObjectRef {
         let mut builder = ProgrammableTransactionBuilder::new();
         move_call! {
@@ -174,24 +175,18 @@ impl TestSetup {
             self.setup_authority_state
                 .get_object(&self.package.0)
                 .await
-                .unwrap()
                 .unwrap(),
         ));
         genesis_objects.push(TestSetup::convert_to_genesis_obj(
             self.setup_authority_state
                 .get_object(&self.gas_object_id)
                 .await
-                .unwrap()
                 .unwrap(),
         ));
 
         for obj in objects {
             genesis_objects.push(TestSetup::convert_to_genesis_obj(
-                self.setup_authority_state
-                    .get_object(obj)
-                    .await
-                    .unwrap()
-                    .unwrap(),
+                self.setup_authority_state.get_object(obj).await.unwrap(),
             ));
         }
         genesis_objects
@@ -206,8 +201,8 @@ async fn update_objects(
     sender: &SuiAddress,
     sender_key: &AccountKeyPair,
     gas_object_id: &ObjectID,
-    shared_object_1: &(ObjectID, SequenceNumber),
-    shared_object_2: &(ObjectID, SequenceNumber),
+    shared_object_1: &ConsensusObjectSequenceKey,
+    shared_object_2: &ConsensusObjectSequenceKey,
     owned_object: &ObjectRef,
 ) -> (Transaction, TransactionEffects) {
     let mut txn_builder = ProgrammableTransactionBuilder::new();
@@ -297,15 +292,23 @@ async fn test_congestion_control_execution_cancellation() {
 
     // Initialize shared object queue so that any transaction touches shared_object_1 should result in congestion and cancellation.
     register_fail_point_arg("initial_congestion_tracker", move || {
-        Some(
-            SharedObjectCongestionTracker::new_with_initial_value_for_test(
-                &[(shared_object_1.0, 10)],
-                PerObjectCongestionControlMode::TotalGasBudget,
+        Some(SharedObjectCongestionTracker::new(
+            [(shared_object_1.0, 10)],
+            PerObjectCongestionControlMode::TotalGasBudget,
+            false,
+            Some(
+                test_setup
+                    .protocol_config
+                    .max_accumulated_txn_cost_per_object_in_mysticeti_commit(),
             ),
-        )
+            Some(1000), // Not used.
+            None,       // Not used.
+            0,          // Disable overage.
+            0,
+        ))
     });
 
-    // Runs a transaction that touches shared_object_1, shared_object_2 and a owned object.
+    // Runs a transaction that touches shared_object_1, shared_object_2 and an owned object.
     let (congested_tx, effects) = update_objects(
         &authority_state,
         &test_setup.package,
@@ -317,7 +320,6 @@ async fn test_congestion_control_execution_cancellation() {
         &authority_state
             .get_object(&owned_object.0)
             .await
-            .unwrap()
             .unwrap()
             .compute_object_reference(),
     )
@@ -349,12 +351,11 @@ async fn test_congestion_control_execution_cancellation() {
         .unwrap();
     authority_state_2
         .epoch_store_for_testing()
-        .acquire_shared_locks_from_effects(
+        .acquire_shared_version_assignments_from_effects(
             &VerifiedExecutableTransaction::new_from_certificate(cert.clone()),
             &effects,
             authority_state_2.get_object_cache_reader().as_ref(),
         )
-        .await
         .unwrap();
     let (effects_2, execution_error) = authority_state_2.try_execute_for_test(&cert).await.unwrap();
 

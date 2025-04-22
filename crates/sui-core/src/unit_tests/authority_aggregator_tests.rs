@@ -29,7 +29,7 @@ use crate::test_authority_clients::{
     HandleTransactionTestAuthorityClient, LocalAuthorityClient, LocalAuthorityClientFaultConfig,
     MockAuthorityApi,
 };
-use crate::test_utils::init_local_authorities;
+use crate::unit_test_utils::init_local_authorities;
 use sui_framework::BuiltInFramework;
 use sui_types::utils::to_sender_signed_transaction;
 use tokio::time::Instant;
@@ -504,11 +504,7 @@ async fn test_map_reducer() {
         |mut accumulated_state, authority_name, _authority_weight, _result| {
             Box::pin(async move {
                 accumulated_state.insert(authority_name);
-                if accumulated_state.len() <= 3 {
-                    ReduceOutput::Continue(accumulated_state)
-                } else {
-                    ReduceOutput::ContinueWithTimeout(accumulated_state, Duration::from_millis(10))
-                }
+                ReduceOutput::Continue(accumulated_state)
             })
         },
         // large delay
@@ -1355,6 +1351,50 @@ async fn test_handle_transaction_response() {
     )
     .await;
 
+    println!("Case 8.3 - Retryable Transaction (EpochEnded Error)");
+
+    set_tx_info_response_with_signed_tx(&mut clients, &authority_keys, &tx, 0);
+
+    // 2 out 4 validators return epoch ended error
+    for (name, _) in authority_keys.iter().skip(2) {
+        clients
+            .get_mut(name)
+            .unwrap()
+            .set_tx_info_response_error(SuiError::EpochEnded(0));
+    }
+    let agg = get_genesis_agg(authorities.clone(), clients.clone());
+    assert_resp_err(
+        &agg,
+        tx.clone().into(),
+        |e| {
+            matches!(
+                e,
+                AggregatorProcessTransactionError::RetryableTransaction { .. }
+            )
+        },
+        |e| matches!(e, SuiError::EpochEnded(0)),
+    )
+    .await;
+
+    println!("Case 8.4 - Retryable Transaction (EpochEnded Error) eventually succeeds");
+
+    set_tx_info_response_with_signed_tx(&mut clients, &authority_keys, &tx, 0);
+
+    // 1 out 4 validators return epoch ended error
+    for (name, _) in authority_keys.iter().take(1) {
+        clients
+            .get_mut(name)
+            .unwrap()
+            .set_tx_info_response_error(SuiError::EpochEnded(0));
+    }
+
+    let agg = get_genesis_agg(authorities.clone(), clients.clone());
+    let cert = agg
+        .process_transaction(tx.clone().into(), Some(client_ip))
+        .await
+        .unwrap();
+    matches!(cert, ProcessTransactionResult::Certified { .. });
+
     println!("Case 9 - Non-Retryable Transaction (>=2f+1 ObjectNotFound Error)");
     // >= 2f+1 object not found errors
     set_retryable_tx_info_response_error(&mut clients, &authority_keys);
@@ -1488,10 +1528,7 @@ async fn test_handle_conflicting_transaction_response() {
         |e| {
             matches!(
                 e,
-                AggregatorProcessTransactionError::RetryableConflictingTransaction {
-                    conflicting_tx_digest_to_retry,
-                    ..
-                } if conflicting_tx_digest_to_retry.is_none()
+                AggregatorProcessTransactionError::RetryableTransaction { .. }
             )
         },
         |e| {
@@ -1521,10 +1558,7 @@ async fn test_handle_conflicting_transaction_response() {
         |e| {
             matches!(
                 e,
-                AggregatorProcessTransactionError::RetryableConflictingTransaction {
-                    conflicting_tx_digest_to_retry,
-                    ..
-                } if conflicting_tx_digest_to_retry.is_none()
+                AggregatorProcessTransactionError::RetryableTransaction { .. }
             )
         },
         |e| {
@@ -1536,7 +1570,7 @@ async fn test_handle_conflicting_transaction_response() {
     )
     .await;
 
-    println!("Case 2 - Non-retryable Tx but Retryable Conflicting Transaction");
+    println!("Case 2 - Non-retryable Tx1 due to conflicting Tx2");
     // Validators return >= f+1 conflicting Tx2
     set_retryable_tx_info_response_error(&mut clients, &authority_keys);
     for (name, _) in authority_keys.iter().skip(1) {
@@ -1553,10 +1587,10 @@ async fn test_handle_conflicting_transaction_response() {
         |e| {
             matches!(
                 e,
-                AggregatorProcessTransactionError::RetryableConflictingTransaction {
-                    conflicting_tx_digest_to_retry,
+                AggregatorProcessTransactionError::FatalConflictingTransaction {
+                    conflicting_tx_digests,
                     ..
-                } if *conflicting_tx_digest_to_retry == Some(*conflicting_tx2.digest())
+                } if conflicting_tx_digests.contains_key(conflicting_tx2.digest())
             )
         },
         |e| {
@@ -1585,14 +1619,17 @@ async fn test_handle_conflicting_transaction_response() {
         |e| {
             matches!(
                 e,
-                AggregatorProcessTransactionError::FatalConflictingTransaction { .. }
+                AggregatorProcessTransactionError::FatalConflictingTransaction {
+                    conflicting_tx_digests,
+                    ..
+                } if conflicting_tx_digests.contains_key(conflicting_tx2.digest())
             )
         },
         |e| matches!(e, SuiError::ObjectLockConflict { .. }),
     )
     .await;
 
-    println!("Case 3 - Non-retryable Tx (Mixed Response - 2 conflicts, 1 signed, 1 non-retryable)");
+    println!("Case 4 - Non-retryable Tx (Mixed Response - 2 conflicts, 1 signed, 1 non-retryable)");
     // Validator 1 returns a signed tx1
     set_tx_info_response_with_signed_tx(&mut clients, &authority_keys, &tx1, 0);
     // Validator 2 returns a conflicting tx2
@@ -1630,7 +1667,10 @@ async fn test_handle_conflicting_transaction_response() {
         |e| {
             matches!(
                 e,
-                AggregatorProcessTransactionError::FatalConflictingTransaction { .. }
+                AggregatorProcessTransactionError::FatalConflictingTransaction {
+                    conflicting_tx_digests,
+                    ..
+                } if !conflicting_tx_digests.is_empty()
             )
         },
         |e| {
@@ -1642,7 +1682,7 @@ async fn test_handle_conflicting_transaction_response() {
     )
     .await;
 
-    println!("Case 3.1 - Non-retryable Tx (Mixed Response - 1 conflict, 1 signed, 1 non-retryable, 1 retryable)");
+    println!("Case 4.1 - Non-retryable Tx (Mixed Response - 1 conflict, 1 signed, 1 non-retryable, 1 retryable)");
     // Validator 1 returns a signed tx1
     set_tx_info_response_with_signed_tx(&mut clients, &authority_keys, &tx1, 0);
     // Validator 2 returns a conflicting tx2
@@ -1680,7 +1720,11 @@ async fn test_handle_conflicting_transaction_response() {
         |e| {
             matches!(
                 e,
-                AggregatorProcessTransactionError::FatalConflictingTransaction { .. }
+                AggregatorProcessTransactionError::FatalConflictingTransaction {
+                    conflicting_tx_digests,
+                    ..
+                } if conflicting_tx_digests.contains_key(conflicting_tx2.digest()) &&
+                conflicting_tx_digests.contains_key(conflicting_tx3.digest())
             )
         },
         |e| {
@@ -1693,7 +1737,7 @@ async fn test_handle_conflicting_transaction_response() {
     .await;
 
     println!(
-        "Case 3.2 - Non-retryable Tx (Mixed Response - 1 conflict, 1 signed, 1 non-retryable, 1 ObjectNotFoundError)"
+        "Case 4.2 - Non-retryable Tx (Mixed Response - 1 conflict, 1 signed, 1 non-retryable, 1 ObjectNotFoundError)"
     );
     // Validator 1 returns a signed tx1
     set_tx_info_response_with_signed_tx(&mut clients, &authority_keys, &tx1, 0);
@@ -1720,7 +1764,10 @@ async fn test_handle_conflicting_transaction_response() {
         |e| {
             matches!(
                 e,
-                AggregatorProcessTransactionError::FatalConflictingTransaction { .. }
+                AggregatorProcessTransactionError::FatalConflictingTransaction {
+                    conflicting_tx_digests,
+                    ..
+                } if conflicting_tx_digests.contains_key(conflicting_tx2.digest())
             )
         },
         |e| {
@@ -1734,7 +1781,7 @@ async fn test_handle_conflicting_transaction_response() {
     )
     .await;
 
-    println!("Case 4 - Successful Conflicting Transaction with Cert");
+    println!("Case 5 - Successful Conflicting Transaction with Cert");
     // All Validators gives signed-tx
     set_tx_info_response_with_signed_tx(&mut clients, &authority_keys, &tx1, 0);
 
@@ -1773,7 +1820,7 @@ async fn test_handle_conflicting_transaction_response() {
         .await
         .unwrap();
 
-    println!("Case 5 - Retryable Transaction (MissingCommitteeAtEpoch Error)");
+    println!("Case 6 - Retryable Transaction (MissingCommitteeAtEpoch Error)");
     // Validators return signed-tx with epoch 1
     set_tx_info_response_with_signed_tx(&mut clients, &authority_keys, &tx1, 1);
 
@@ -1815,7 +1862,7 @@ async fn test_handle_conflicting_transaction_response() {
         |e| {
             matches!(
                 e,
-                AggregatorProcessTransactionError::RetryableConflictingTransaction { .. }
+                AggregatorProcessTransactionError::RetryableTransaction { .. }
             )
         },
         |e| {
@@ -1827,7 +1874,7 @@ async fn test_handle_conflicting_transaction_response() {
     )
     .await;
 
-    println!("Case 5.1 - Retryable Transaction (WrongEpoch Error)");
+    println!("Case 6.1 - Retryable Transaction (WrongEpoch Error)");
     // Update committee store to epoch 2, now SafeClient will pass
     let committee_2 =
         Committee::new_for_testing_with_normalized_voting_power(2, authorities.clone());
@@ -1840,7 +1887,7 @@ async fn test_handle_conflicting_transaction_response() {
         |e| {
             matches!(
                 e,
-                AggregatorProcessTransactionError::RetryableConflictingTransaction { .. }
+                AggregatorProcessTransactionError::RetryableTransaction { .. }
             )
         },
         |e| {
@@ -1852,7 +1899,7 @@ async fn test_handle_conflicting_transaction_response() {
     )
     .await;
 
-    println!("Case 5.2 - Successful Cert Transaction");
+    println!("Case 6.2 - Successful Cert Transaction");
     // Update aggregator committee to epoch 2, and transaction will succeed.
     agg.committee = Arc::new(committee_2);
     agg.process_transaction(tx1.clone().into(), Some(client_ip))
@@ -2407,14 +2454,6 @@ async fn assert_resp_err<E, F>(
 {
     match agg.process_transaction(tx, Some(make_socket_addr())).await {
         Err(received_agg_err) if agg_err_checker(&received_agg_err) => match received_agg_err {
-            AggregatorProcessTransactionError::RetryableConflictingTransaction {
-                errors,
-                conflicting_tx_digest_to_retry: _,
-                conflicting_tx_digests,
-            } => {
-                assert!(!conflicting_tx_digests.is_empty());
-                assert!(errors.iter().map(|e| &e.0).all(sui_err_checker));
-            }
             AggregatorProcessTransactionError::TxAlreadyFinalizedWithDifferentUserSignatures => (),
             AggregatorProcessTransactionError::FatalConflictingTransaction {
                 errors,

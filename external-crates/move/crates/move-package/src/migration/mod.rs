@@ -20,7 +20,7 @@ pub const EDITION_SELECT_PROMPT: &str = "Please select one of the following edit
 
 pub static EDITION_OPTIONS: Lazy<BTreeMap<String, Edition>> = Lazy::new(|| {
     let mut map = BTreeMap::new();
-    map.insert("1".to_string(), Edition::E2024_BETA);
+    map.insert("1".to_string(), Edition::E2024);
     map.insert("2".to_string(), Edition::LEGACY);
     map
 });
@@ -50,7 +50,7 @@ pub const NO_MIGRATION_NEEDED_MSG: &str = "No migration is required. Enjoy!";
 pub const BAR: &str = "============================================================";
 
 pub struct MigrationContext<'a, W: Write, R: BufRead> {
-    build_plan: BuildPlan,
+    build_plan: &'a BuildPlan<'a>,
     terminal: Terminal<'a, W, R>,
 }
 
@@ -59,7 +59,7 @@ pub struct MigrationOptions {
 }
 
 pub fn migrate<W: Write, R: BufRead>(
-    build_plan: BuildPlan,
+    build_plan: &BuildPlan,
     writer: &mut W,
     reader: &mut R,
 ) -> anyhow::Result<MigrationOptions> {
@@ -67,9 +67,9 @@ pub fn migrate<W: Write, R: BufRead>(
     mcontext.prompt_for_migration()
 }
 
-impl<'a, W: Write, R: BufRead> MigrationContext<'a, W, R> {
+impl<W: Write, R: BufRead> MigrationContext<'_, W, R> {
     pub fn new<'new>(
-        build_plan: BuildPlan,
+        build_plan: &'new BuildPlan,
         writer: &'new mut W,
         reader: &'new mut R,
     ) -> MigrationContext<'new, W, R> {
@@ -95,7 +95,7 @@ impl<'a, W: Write, R: BufRead> MigrationContext<'a, W, R> {
                 self.terminal.writeln(EDITION_RECORDED_MSG)?;
                 self.terminal.newline()?;
             }
-            Edition::E2024_BETA => {
+            Edition::E2024 => {
                 self.terminal.newline()?;
                 self.terminal.newline()?;
                 self.perform_upgrade()?;
